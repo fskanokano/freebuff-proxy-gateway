@@ -69,6 +69,9 @@ function splitList(v) {
     .filter(Boolean);
 }
 
+// 构建版本标识: 注入 admin HTML (便于确认加载的是最新 UI, 排查缓存问题)
+const GW_BUILD = '0b7c06f';
+
 function parseEnv(env) {
   const cfg = { ...DEFAULTS };
   for (const k of Object.keys(DEFAULTS)) {
@@ -641,12 +644,15 @@ function passthroughHeaders(res, proxyName) {
   return h;
 }
 
+// 所有网关响应的公共头。Cache-Control: no-store 防止 CF 边缘/浏览器缓存旧版
+// admin UI 或动态状态 (API 网关无缓存语义; 此前用户加载到缓存旧页面导致界面异常)。
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-API-Key, X-Sticky-Id',
     'Access-Control-Expose-Headers': 'X-Gateway-Proxy, Retry-After',
+    'Cache-Control': 'no-store',
   };
 }
 
@@ -1218,8 +1224,9 @@ export default {
 
     // 管理后台
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
-      return new Response(ADMIN_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders() },
+      const html = ADMIN_HTML.replace('<!--GWVERSION-->', GW_BUILD);
+      return new Response(html, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...corsHeaders() },
       });
     }
     if (url.pathname.startsWith('/admin/api/')) {

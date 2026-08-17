@@ -9,6 +9,7 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#F2F2F7">
 <title>Proxy Gateway</title>
+<!--GWVERSION-->
 <style>
 :root{
   --bg:#F2F2F7; --card:#FFFFFF; --card2:#F8F8FA; --text:#000000; --text2:rgba(60,60,67,.62);
