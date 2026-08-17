@@ -177,6 +177,20 @@ const CACHE_ORIGIN = 'https://cf-quota-gateway.invalid';
 // 状态 key 掺入 url 哈希: 同名不同 URL 的 proxy 状态互不串扰 (重配 url 后旧状态作废)
 function stateKey(name, url) { return CACHE_ORIGIN + '/state/' + encodeURIComponent(name) + '/' + hashKey(url); }
 function pinKey(sticky) { return CACHE_ORIGIN + '/pin/' + hashKey(sticky); }
+// 最近路由记录: 独立于状态缓存持久化 (TTL 1h), 不随 STATE_TTL(60s) 过期丢失
+function lastUsedKey(name, url) { return CACHE_ORIGIN + '/lastused/' + encodeURIComponent(name) + '/' + hashKey(url); }
+
+// 记录一次成功路由 (幂等累加计数)
+async function recordLastUsed(name, url) {
+  try {
+    const r = await caches.default.get(lastUsedKey(name, url));
+    let n = 1;
+    if (r) { try { const j = await r.json(); n = (j.requestsOk || 0) + 1; } catch (e) {} }
+    await caches.default.put(lastUsedKey(name, url), new Response(JSON.stringify({ at: nowMs(), requestsOk: n }), {
+      headers: { 'Content-Type': 'application/json' },
+    }), { ttl: 3600 });
+  } catch (e) { /* 尽力而为 */ }
+}
 
 // isolate 级 L1 状态缓存 + 单飞探测。键 = name + url 哈希,
 // 同名不同 URL 的 proxy 状态互不串扰。
@@ -723,6 +737,7 @@ async function routeRequest(req, cfg, body) {
   }
 
   const attempts = [];
+  const reqStarted = nowMs();
   const ac = new AbortController();
   const onClientAbort = () => ac.abort();
   req.signal.addEventListener('abort', onClientAbort, { once: true });
@@ -760,6 +775,7 @@ async function routeRequest(req, cfg, body) {
       st.backoff = 60;
       st.nextProbe = 0;
       await putState(st, cfg);
+      await recordLastUsed(st.name, st.url); // 最近路由持久化 (独立 TTL, 跨 isolate 可见)
       if (sticky) await setPin(sticky, st.name, cfg);
       attempts.push(cl);
       log(cfg, 'debug', 'relayed', { name: st.name, status: cl.resp.status, ms: cl.ms, sticky: !!sticky });
@@ -769,6 +785,8 @@ async function routeRequest(req, cfg, body) {
       for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
       h.set('x-gateway-attempts', String(attempts.length));
       if (isChat && sticky) h.set('x-gateway-pin', st.name);
+      // 路由记录: 每次成功响应一条 (含 failover 尝试次数)
+      pushRoute(cfg, { name: st.name, status: cl.resp.status, attempts: attempts.length, ms: nowMs() - reqStarted, model: model || null, ok: true });
       return new Response(cl.resp.body, { status: cl.resp.status, headers: h });
     }
 
@@ -790,6 +808,16 @@ async function routeRequest(req, cfg, body) {
 
   req.signal.removeEventListener('abort', onClientAbort);
   const agg = aggregateError(attempts, cfg);
+  // 路由记录: 全部尝试失败的情况 (记录最终状态与最后尝试的代理)
+  const last = attempts[attempts.length - 1];
+  pushRoute(cfg, {
+    name: last ? last.name : null,
+    status: agg.passthrough ? agg.resp.status : (agg.error ? agg.error.status : 502),
+    attempts: attempts.length,
+    ms: nowMs() - reqStarted,
+    model: model || null,
+    ok: false,
+  });
   if (agg.passthrough) {
     const h = passthroughHeaders(agg.resp, attempts[0].name);
     for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
@@ -845,6 +873,43 @@ async function handleModels(req, cfg) {
   return new Response(JSON.stringify({ object: 'list', data }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
   });
+}
+
+// ─────────────────────────── 路由记录 (每次请求) ───────────────────────────
+
+// 与系统事件分离的独立环形缓冲: 每次请求(成功/失败)一条, 不被状态变更事件挤掉
+const ROUTES_KEY = CACHE_ORIGIN + '/routes';
+const MAX_ROUTES = 200;
+const ROUTE_L1 = [];
+
+function pushRoute(cfg, detail) {
+  ROUTE_L1.push({ t: nowMs(), ...detail });
+  if (ROUTE_L1.length >= 10) flushRoutes(cfg).catch(() => {});
+}
+
+async function flushRoutes(cfg) {
+  if (ROUTE_L1.length === 0) return;
+  const batch = ROUTE_L1.splice(0);
+  try {
+    let list = [];
+    const r = await caches.default.get(ROUTES_KEY);
+    if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
+    list = [...list, ...batch];
+    if (list.length > MAX_ROUTES) list = list.slice(list.length - MAX_ROUTES);
+    await caches.default.put(ROUTES_KEY, new Response(JSON.stringify(list), {
+      headers: { 'Content-Type': 'application/json' },
+    }), { ttl: 86400 });
+  } catch (e) { /* 尽力而为 */ }
+}
+
+async function readRoutes() {
+  try {
+    await flushRoutes({}); // 先把 L1 累积写入
+    const r = await caches.default.get(ROUTES_KEY);
+    if (!r) return [];
+    const j = await r.json();
+    return Array.isArray(j) ? j.slice(-MAX_ROUTES) : [];
+  } catch (e) { return []; }
 }
 
 // ─────────────────────────── 事件日志 ───────────────────────────
@@ -1084,7 +1149,8 @@ async function adminOverview(cfg) {
     requestsFail: proxies.reduce((a, p) => a + p.requestsFail, 0),
   };
   const events = await readEvents();
-  return new Response(JSON.stringify({ status: 'ok', stats, proxies, events, timestamp: new Date().toISOString() }), {
+  const routes = await readRoutes();
+  return new Response(JSON.stringify({ status: 'ok', stats, proxies, events, routes, timestamp: new Date().toISOString() }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
   });
 }
@@ -1229,14 +1295,20 @@ async function adminPinStatus(req, cfg) {
   const sticky = stickyKeyFor(req, cfg);
   let pinned = null;
   if (sticky) pinned = await getPin(sticky, cfg);
-  // 最近路由事实: 每个代理的最后成功命中时间与计数 (来自 state.lastUsed)。
-  // 注意: 必须走 getState (会读跨 isolate 的 cache), 不能 l1Get 短路 —— L1 里可能是
-  // blankState (本 isolate 未处理过该代理), 短路会导致永远读不到其他 isolate 的聊天记录。
+  // 最近路由事实: 优先读持久化的 last-used 记录 (TTL 1h, 不随状态过期丢失),
+  // fallback 到状态里的 lastUsed。
   const recent = [];
   for (const p of cfg.proxies) {
-    const st = await getState(p, cfg);
-    if (st && st.lastUsed > 0) {
-      recent.push({ name: p.name, lastUsed: st.lastUsed, requestsOk: st.requestsOk || 0 });
+    let lu = null;
+    try {
+      const r = await caches.default.get(lastUsedKey(p.name, p.url));
+      if (r) { const j = await r.json(); if (j && j.at > 0) lu = { at: j.at, requestsOk: j.requestsOk || 0 }; }
+    } catch (e) {}
+    if (lu) {
+      recent.push({ name: p.name, lastUsed: lu.at, requestsOk: lu.requestsOk });
+    } else {
+      const st = await getState(p, cfg);
+      if (st && st.lastUsed > 0) recent.push({ name: p.name, lastUsed: st.lastUsed, requestsOk: st.requestsOk || 0 });
     }
   }
   recent.sort((a, b) => b.lastUsed - a.lastUsed);

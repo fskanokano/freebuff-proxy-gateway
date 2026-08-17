@@ -1276,6 +1276,47 @@ await t('ADM15 recent_proxies 跨 isolate 可见 (L1 blankState 时不短路 cac
   assert.equal(pr.recent_proxies[0].requestsOk, 3);
 });
 
+await t('ADM16 最近路由持久化: 状态缓存过期后仍可见 (last-used 独立 TTL)', async () => {
+  const p = await makeProxy('pk6');
+  const env = envFor([p], { API_KEY: 't-pin6' });
+  const name = proxyNames([p])[0];
+  // 聊天 → 写入最近路由记录
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-pin6' }), env, {});
+  assert.equal(res.status, 200);
+  // 快进超过 STATE_TTL(60s): 代理状态缓存过期, 但最近路由记录(独立 TTL 1h)不应丢失
+  advance(70e3);
+  const pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin6' } }), env, {})).json();
+  assert.ok(Array.isArray(pr.recent_proxies) && pr.recent_proxies.some(x => x.name === name),
+    'recent routing should survive state TTL expiry, got: ' + JSON.stringify(pr.recent_proxies));
+  assert.ok(pr.recent_proxies[0].requestsOk >= 1);
+});
+
+await t('ADM17 每次请求都记录路由日志 (成功/失败, overview 返回 routes)', async () => {
+  const p1 = await makeProxy('rk1'); const p2 = await makeProxy('rk2');
+  const [n1] = proxyNames([p1, p2]);
+  const env = envFor([p1, p2], { API_KEY: 't-rk' });
+  // 成功请求 → 路由记录
+  let r = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-rk' }), env, {});
+  assert.equal(r.status, 200);
+  // 失败请求 (p1 429 + p2 502 → 全失败, 聚合按 quota 优先返回 429)
+  p1.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 60, body: 'x' };
+  p2.ctl.fail = { status: 502, code: 'boom', body: 'x' };
+  r = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-rk' }), env, {});
+  assert.equal(r.status, 429); // 聚合优先级: quota(429) > down(502)
+  const ov = await (await worker.fetch(new Request('https://gw.example/admin/api/overview', { headers: { Authorization: 'Bearer t-rk' } }), env, {})).json();
+  assert.ok(Array.isArray(ov.routes) && ov.routes.length >= 2, 'routes should be recorded, got: ' + JSON.stringify(ov.routes));
+  // 最近两条 = 本测试的 成功 + 失败
+  const prev = ov.routes[ov.routes.length - 2];
+  assert.equal(prev.ok, true);
+  assert.equal(prev.name, n1);
+  assert.equal(prev.status, 200);
+  assert.ok(prev.t > 0 && prev.ms >= 0);
+  const last = ov.routes[ov.routes.length - 1]; // 最新
+  assert.equal(last.ok, false);
+  assert.equal(last.status, 429);
+  assert.equal(last.attempts, 2);
+});
+
 console.log('\n== 运行时配置 (后台管理代理/参数) ==');
 
 await t('RUN1 保存代理列表 → 立即生效, 路由用新代理 + 各自的 apiKey', async () => {

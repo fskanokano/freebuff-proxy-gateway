@@ -9,6 +9,12 @@ const iso = ms => ms ? new Date(ms).toISOString() : null;
 const fakeOverview = {
   status: 'ok',
   stats: { total: 3, ok: 2, depleted: 1, down: 0, requestsOk: 1284, requestsFail: 23 },
+  routes: [
+    { t: now - 5e3, name: 'proxy-b', status: 200, attempts: 1, ms: 812, model: 'freebuff-1', ok: true },
+    { t: now - 18e3, name: 'proxy-a', status: 200, attempts: 1, ms: 1240, model: 'freebuff-1', ok: true },
+    { t: now - 42e3, name: 'proxy-c', status: 429, attempts: 2, ms: 2310, model: 'freebuff-1', ok: false },
+    { t: now - 61e3, name: 'proxy-a', status: 200, attempts: 1, ms: 998, model: 'freebuff-1', ok: true },
+  ],
   proxies: [
     {
       name: 'proxy-a', url: 'https://proxy-a.workers.dev', status: 'ok', maint: false,

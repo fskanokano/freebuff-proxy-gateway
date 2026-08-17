@@ -332,6 +332,15 @@ function proxyCard(pr){
 }
 function renderProxies(d){
   var el=$("#view-proxies");
+  // 防抖: 数据无变化时跳过整页重建 (轮询 5s 触发, 避免界面跳变/闪烁)
+  var sig=JSON.stringify((d.proxies||[]).map(function(p){
+    return [p.name,p.status,p.maint,p.score,p.requestsOk,p.requestsFail,p.detail,p.last_ok,p.next_probe];
+  }));
+  if(sig===_proxiesSig){
+    refreshPinBanner(); // 仍刷新常驻信息
+    return;
+  }
+  _proxiesSig=sig;
   el.innerHTML='<h2 class="section">代理</h2>'+
     '<div class="sub">开关 = 代理启用状态 (关 = 进入维护, 不参与选路); 支持添加/编辑/删除代理</div>'+
     '<div id="pinBanner"></div>'+
@@ -342,17 +351,7 @@ function renderProxies(d){
   api("/config").then(function(cd){
     _cfgProxies=(cd.config&&cd.config.proxies||[]).slice();
   }).catch(function(){});
-  // 当前常驻代理 (sticky pin) 状态
-  api("/pin").then(function(pd){
-    renderPinBanner(pd);
-    if(pd&&pd.pinned_proxy){
-      var card=el.querySelector('.proxy[data-name="'+pd.pinned_proxy+'"]');
-      if(card){
-        card.classList.add("pinned");
-        card.querySelector(".proxy-name").insertAdjacentHTML("beforeend",' <span class="pill pinned">常驻</span>');
-      }
-    }
-  }).catch(function(){});
+  refreshPinBanner();
   // 直接为每个卡片绑定事件 (比事件委托更可靠, 避免代理名/嵌套导致 closest 失效)
   el.querySelectorAll(".proxy").forEach(function(card){
     var name=card.dataset.name;
@@ -396,6 +395,22 @@ function renderProxies(d){
   $("#addProxyBtn").onclick=function(){openProxyModal(null)};
 }
 // 常驻/最近路由信息条: 优先显示当前会话钉住 (常驻) 的代理, 否则显示最近实际路由到的代理
+// 常驻/最近路由信息: 独立刷新 (不随代理页重建), 卡片标记同步
+function refreshPinBanner(){
+  api("/pin").then(function(pd){
+    renderPinBanner(pd);
+    var pinned=pd&&pd.pinned_proxy?pd.pinned_proxy:null;
+    document.querySelectorAll('#view-proxies .proxy').forEach(function(card){
+      var nm=card.dataset.name;
+      var isPinned=pinned===nm;
+      card.classList.toggle("pinned",isPinned);
+      var badge=card.querySelector(".pill.pinned");
+      if(isPinned&&!badge)card.querySelector(".proxy-name").insertAdjacentHTML("beforeend",' <span class="pill pinned">常驻</span>');
+      else if(!isPinned&&badge)badge.remove();
+    });
+  }).catch(function(){});
+}
+var _proxiesSig=null; // 代理页渲染签名 (数据无变化不重建, 防跳变)
 function renderPinBanner(pd){
   var el=$("#pinBanner");if(!el)return;
   var recent=pd&&pd.recent_proxies&&pd.recent_proxies.length?pd.recent_proxies[0]:null;
@@ -419,23 +434,58 @@ function renderPinBanner(pd){
   el.innerHTML='<div class="pin-banner"><div><div>当前会话 <b>未常驻</b>, 暂无路由记录</div>'+
     '<div class="pin-sub">PIN_MODE='+esc(modeTxt)+' · 客户端发起成功请求后会自动钉住所选代理</div></div></div>';
 }
-/* ── 渲染: 日志 ── */
+/* ── 渲染: 日志 (路由记录 + 系统事件, 可筛选) ── */
 function renderEvents(d){
   var el=$("#view-events");
-  el.innerHTML='<h2 class="section">运行日志</h2><div class="sub">状态变更 / 故障切换 / 探测失败 / 管理操作 (最多 '+200+" 条)</div>";
-  if(!d.events.length){el.insertAdjacentHTML("beforeend",'<div class="card"><div class="empty">暂无事件</div></div>');return}
-  var icons={status_change:"●",failover:"⇄",probe_failed:"!",maintenance:"◐",admin_action:"⚙",smoke:"✓"};
-  var box=document.createElement("div");box.className="card";
-  d.events.slice().reverse().forEach(function(ev){
-    var e=document.createElement("div");e.className="event";
-    var desc=ev.name?esc(ev.name)+" ":"";if(ev.from&&ev.to)desc+="("+esc(ev.from)+" → "+esc(ev.to)+")";
-    if(ev.code)desc+=" · "+esc(ev.code);if(ev.err)desc+=" · "+esc(ev.err);if(ev.detail)desc+=" · "+esc(ev.detail);
-    e.innerHTML='<div class="event-ico '+(icons[ev.type]?"":ev.type)+'">'+(icons[ev.type]||"·")+"</div>"+
-      '<div class="event-main"><div class="event-title">'+esc(ev.type)+'</div><div class="event-desc">'+desc+"</div>"+
-      '<div class="event-time">'+esc(fmtTime(ev.t))+" · "+esc(fmtAgo(ev.t))+"</div></div>";
-    box.appendChild(e);
+  el.innerHTML='<h2 class="section">日志</h2><div class="sub">每次请求的路由记录 (最近 200 条) 与系统事件</div>'+
+    '<div class="seg" id="evFilter">'+
+    '<button data-f="all" class="active">全部</button>'+
+    '<button data-f="route">路由记录</button>'+
+    '<button data-f="system">系统事件</button></div>'+
+    '<div id="evList"></div>';
+  el.querySelectorAll("#evFilter button").forEach(function(b){
+    b.onclick=function(){
+      el.querySelectorAll("#evFilter button").forEach(function(x){x.classList.remove("active")});
+      b.classList.add("active");
+      renderEventList(d,b.dataset.f);
+    };
   });
-  el.appendChild(box);
+  renderEventList(d,"all");
+}
+function renderEventList(d,filter){
+  var box=$("#evList");box.innerHTML="";
+  var routes=(d.routes||[]).slice();
+  var events=(d.events||[]).slice();
+  var items=[];
+  if(filter==="all"||filter==="system")events.forEach(function(ev){items.push({t:ev.t,kind:"event",ev:ev})});
+  if(filter==="all"||filter==="route")routes.forEach(function(r){items.push({t:r.t,kind:"route",r:r})});
+  items.sort(function(a,b){return (b.t||0)-(a.t||0)});
+  if(!items.length){
+    box.innerHTML='<div class="card"><div class="empty">暂无记录 — 发起一次请求后这里会显示路由日志</div></div>';
+    return;
+  }
+  var card=document.createElement("div");card.className="card";
+  items.forEach(function(it){
+    var e=document.createElement("div");e.className="event";
+    if(it.kind==="route"){
+      var r=it.r;
+      var okCls=r.ok?'<span class="pill ok">成功</span>':'<span class="pill down">失败</span>';
+      e.innerHTML='<div class="event-ico smoke">⇄</div>'+
+        '<div class="event-main"><div class="event-title">路由 → '+esc(r.name||"—")+' '+okCls+'</div>'+
+        '<div class="event-desc">HTTP '+esc(r.status||"—")+' · 尝试 '+esc(r.attempts||1)+' 次 · '+esc(r.ms||0)+'ms'+(r.model?' · '+esc(r.model):'')+'</div>'+
+        '<div class="event-time">'+esc(fmtTime(r.t))+' · '+esc(fmtAgo(r.t))+'</div></div>';
+    }else{
+      var ev=it.ev;
+      var icons={status_change:"●",failover:"⇄",probe_failed:"!",maintenance:"◐",admin_action:"⚙",smoke:"✓"};
+      var desc=ev.name?esc(ev.name)+" ":"";if(ev.from&&ev.to)desc+="("+esc(ev.from)+" → "+esc(ev.to)+")";
+      if(ev.code)desc+=" · "+esc(ev.code);if(ev.err)desc+=" · "+esc(ev.err);if(ev.detail)desc+=" · "+esc(ev.detail);
+      e.innerHTML='<div class="event-ico '+(icons[ev.type]?"":ev.type)+'">'+(icons[ev.type]||"·")+"</div>"+
+        '<div class="event-main"><div class="event-title">'+esc(ev.type)+'</div><div class="event-desc">'+desc+"</div>"+
+        '<div class="event-time">'+esc(fmtTime(ev.t))+" · "+esc(fmtAgo(ev.t))+"</div></div>";
+    }
+    card.appendChild(e);
+  });
+  box.appendChild(card);
 }
 /* ── 渲染: 测试 ── */
 var _tModels=[]; // 模型下拉缓存
