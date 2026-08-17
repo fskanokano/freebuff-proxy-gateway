@@ -64,7 +64,8 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 | `STATE_TTL_SECONDS` | | ok 状态 `/healthz` 刷新间隔，默认 `60`（下限 60） |
 | `DEPLETED_PROBE_SECONDS` | | depleted 探测最大退避，默认 `300` |
 | `DOWN_PROBE_SECONDS` | | down 探测基础退避，默认 `120` |
-| `PROBE_TIMEOUT_MS` | | healthz 探测超时，默认 `3000` |
+| `PROBE_TIMEOUT_MS` | | healthz 探测超时（`/v1/models` 上游聚合超时复用该值），默认 `3000` |
+| `CHAT_TIMEOUT_MS` | | 非流式 chat **单次尝试**超时，默认 `120000`（2 分钟，下限 1000）。仅对非流式请求生效：上游挂死（连接建立但不响应）时网关主动中止该次尝试并 failover 到下一 proxy，而不是让请求挂到客户端超时。**流式请求不受此限制**（流一旦开始由客户端断开兜底） |
 | `MAX_ATTEMPTS` | | 单请求最大尝试 proxy 数，默认 `3` |
 | `LOG_LEVEL` | | `info`（默认）\| `debug` |
 
@@ -124,7 +125,7 @@ npx wrangler dev
 - **代理**：每代理详情（状态/原因/分数/配额/重置时刻/连续错误）、**立即探测**、**启用开关**（关 = 进入维护，不参与选路）、**添加/编辑/删除代理**（保存后立即生效，跨边缘传播延迟几秒）
 - **日志**：状态变更 / failover / 探测失败 / 管理操作事件流
 - **测试**：发一条真实请求走完整路由链路（模型下拉自动聚合各代理），结果人类可读
-- **设置**：**路由参数可编辑并保存**（PIN_MODE / 各 TTL / 探测超时 / 尝试次数）、鉴权脱敏展示、当前代理列表、**恢复环境变量**（清除后台运行时配置）、外观切换
+- **设置**：**路由参数可编辑并保存**（PIN_MODE / 各 TTL / 探测超时 / 非流式聊天超时 / 尝试次数）、鉴权脱敏展示、当前代理列表、**恢复环境变量**（清除后台运行时配置）、外观切换
 
 **运行时配置**：后台的代理增删改与参数修改会保存为"运行时配置"（优先级高于环境变量，用户改动为准），部署/重启后仍生效；点"恢复环境变量"即清除并回到环境变量配置。默认值内置于代码（不再通过 wrangler vars 注入），可用 Variables & Secrets 覆盖。
 
@@ -164,9 +165,10 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 
 | 响应 | 判定 | 处置 |
 |---|---|---|
-| 429 rate_limited / 402 out_of_credits | depleted | 解析 `Retry-After` 与 body 里 `reset at <RFC3339>`，`nextProbe = resetAt+10s`；重放请求切换 |
+| 429 rate_limited / 402 out_of_credits | depleted | 解析 `Retry-After`（秒数或 HTTP-date 均可）与 body 里 `reset at <RFC3339>`，`nextProbe = resetAt+10s`；reset 缺失/非法/在过去时回退指数退避（防止重探风暴）；重放请求切换 |
 | 403 account_banned | depleted(banned) | 长退避（≥300s） |
 | 403 country_blocked / 5xx / 网络错 | down | 指数退避 120→300s |
+| 非流式 chat 单次尝试超时（`CHAT_TIMEOUT_MS`，默认 120s） | down | 网关主动中止挂死（不响应）的尝试并 failover；流式不受限 |
 | 401（proxy 拒绝网关 key） | bad_config | 退避重试，最终 502 提示检查 PROXIES 配置 |
 | 400 / 404（客户端错） | — | 原样透传，**不** failover |
 
@@ -179,7 +181,8 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 
 - **状态最终一致**：`caches.default` 跨 isolate 共享但非强一致。极端情况（两个 isolate 同时把不同客户端钉到同一 proxy）只是加速消耗该 proxy 额度，不影响正确性
 - **额度是"信号"而非"计数"**：网关不精确扣减每次请求的额度，靠 healthz 刷新 + 带内 429/402 兜底。proxy 侧建议配 `MAX_MESSAGES_PER_DAY` 让 UsagePct 有参考价值
-- 请求体会被网关缓冲（≤32MB）以支持 failover 重放；超大/非 JSON 请求体不缓冲（原样转发但无法重放）
+- 请求体会被网关缓冲（≤32MB，json/text 类型）以支持 failover 重放；其余类型（multipart/octet-stream/ndjson 等）原样透传请求体流，但**不可重放**——首次尝试失败后不 failover，直接返回该次结果。透传分支不做缓冲，超限防护改为 **content-length 预检**（声明 >32MB 直接 413）；无长度（chunked）的流只能依赖边缘/上游限制
+- 非流式 chat 有单次尝试超时（`CHAT_TIMEOUT_MS`）；流式响应不做网关侧超时，挂起的流由客户端断开兜底（客户端取消会中止上游请求并返回 499，且不会把健康 proxy 误标 down）
 - 单 proxy 配了多个 token 也能用（healthz 只取 `tokens[0]`）——但建议按"1 proxy = 1 token"部署以让网关的额度视图精确
 - 网关自身无持久化；`/v1/models` 每次聚合各 proxy 实况
 
@@ -189,4 +192,4 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 node test/test.mjs
 ```
 
-85 个场景覆盖：核心路由(选路/钉住/failover/恢复/流式) + 配置解析极端(非法URL/重复/数量不匹配/缺必填) + 鉴权极端(大小写/空白/ADMIN_KEY隔离) + 路由极端(单proxy/全down/全网络错/LRU/维护模式/pin失效) + failover极端(429时间信息三态/403矩阵/401/404/重试上限/聚合优先级/流式中断/退避封顶) + 探测极端(healthz 500/超时/畸形/单飞/恢复/未恢复) + 请求体极端(空体/非法JSON/33MB/流式兼容) + 状态缓存极端(写失败/时钟回拨/TTL边界/同名隔离) + 管理后台(overview/脱敏/probe/maintenance/pin/smoke/事件日志)。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 caches.default 与假时钟。测试还抓到并修复了 4 个真实 bug：surface 误标 down、维护标记残留、updatedAt 续期阻止重探测、异常状态保活窗口不足。
+113 个场景覆盖：核心路由(选路/钉住/failover/恢复/流式) + 配置解析极端(非法URL/重复/数量不匹配/缺必填) + 鉴权极端(大小写/空白/ADMIN_KEY隔离) + 路由极端(单proxy/全down/全网络错/LRU/维护模式/pin失效) + failover极端(429时间信息三态/403矩阵/401/404/重试上限/聚合优先级/流式中断/退避封顶) + 探测极端(healthz 500/超时/畸形/单飞/恢复/未恢复) + 请求体极端(空体/非法JSON/33MB/流式兼容/非JSON透传/透传超限413) + 状态缓存极端(写失败/时钟回拨/TTL边界/同名隔离) + 管理后台(overview/脱敏/probe/maintenance/pin/smoke/事件日志) + 隐藏 bug 回归(日额度透传/零值时间/HTTP-date Retry-After/客户端中断/非流式chat超时/运行时配置合并与去重/参数合并/脏数据降级/smoke 钉住污染/models 超时)。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 caches.default 与假时钟。FO13 退避断言已固定 jitter（消除 cache TTL 与新鲜窗口的竞态抖动，suite 稳定可作绿门）。测试历史上还抓到并修复过真实 bug：surface 误标 down、维护标记残留、updatedAt 续期阻止重探测、异常状态保活窗口不足。

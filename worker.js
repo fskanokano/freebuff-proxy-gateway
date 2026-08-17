@@ -48,6 +48,7 @@ const DEFAULTS = {
   DEPLETED_PROBE_SECONDS: 300,   // depleted 探测最大退避
   DOWN_PROBE_SECONDS: 120,       // down 探测基础退避
   PROBE_TIMEOUT_MS: 3000,        // healthz 探测超时
+  CHAT_TIMEOUT_MS: 120000,       // 非流式 chat 单次尝试超时 (流式不受限, 由客户端断开兜底)
   MAX_ATTEMPTS: 3,               // 单请求最大尝试 proxy 数
   LOG_LEVEL: 'info',             // debug | info | warn
 };
@@ -83,6 +84,9 @@ function parseEnv(env) {
   cfg.depletedProbe = Math.max(60, Math.floor(Number(cfg.DEPLETED_PROBE_SECONDS) || 300));
   cfg.downProbe = Math.max(30, Math.floor(Number(cfg.DOWN_PROBE_SECONDS) || 120));
   cfg.probeTimeout = Math.max(500, Math.floor(Number(cfg.PROBE_TIMEOUT_MS) || 3000));
+  // 非流式 chat 单次尝试超时: 挂死(不响应)的 proxy 也要能触发 failover。
+  // 刻意不用 probeTimeout(3s): 非流式补全等待模型生成, 3s 会杀掉正常请求。
+  cfg.chatTimeout = Math.max(1000, Math.floor(Number(cfg.CHAT_TIMEOUT_MS) || 120000));
   cfg.maxAttempts = Math.max(1, Math.min(6, Math.floor(Number(cfg.MAX_ATTEMPTS) || 3)));
   cfg.debug = String(cfg.LOG_LEVEL).toLowerCase() === 'debug';
 
@@ -166,9 +170,12 @@ function hashKey(s) {
 
 function parseTs(v) {
   if (!v) return 0;
-  if (typeof v === 'number') return v > 1e12 ? v : v * 1000; // unix s or ms
-  const n = Date.parse(v);
-  return Number.isFinite(n) ? n : 0;
+  let n;
+  if (typeof v === 'number') n = v > 1e12 ? v : v * 1000; // unix s or ms
+  else n = Date.parse(v);
+  // 拒绝 0 / 负值 / 1970 前: Go 零值 "0001-01-01T00:00:00Z" 会被 Date.parse 解析成
+  // 巨大负数, 落进 st.nextProbe 会让每次请求都立即重探/重试 (探测风暴)。
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 function nowMs() { return Date.now(); }
@@ -218,6 +225,8 @@ function blankState(p) {
     reason: '',
     score: 50,               // 0-100 估算用量 (低=余量多); 未知取 50
     usagePct: 0,
+    dailyLimit: 0,           // 日额度 (healthz DailyLimit, 供 /healthz 观测)
+    messages24h: 0,          // 24h 已用消息数 (healthz Messages24h)
     quota: {},               // model -> {limit, recentCount, resetAt, period}
     cooldownUntil: 0,
     resetAt: 0,              // 已知最早的额度重置时间 (ms)
@@ -333,6 +342,8 @@ function parseHealthz(json, model) {
 // 根据一次 healthz 探测结果把状态归一化
 function applyHealthz(st, h) {
   st.usagePct = h.usagePct;
+  st.dailyLimit = h.dailyLimit || 0;
+  st.messages24h = h.messages24h || 0;
   st.quota = h.quota;
   st.cooldownUntil = h.cooldownUntil;
   st.resetAt = h.resetAt || 0;
@@ -397,7 +408,6 @@ async function doProbe(p, cfg) {
       pushEvent(cfg, 'status_change', { name: p.name, from: st._prev, to: st.status, reason: st.reason, detail: st.detail });
       st.statusChangedAt = nowMs();
     }
-    delete st._prev;
     log(cfg, 'debug', 'probe ok', { name: p.name, status: st.status, score: st.score, usagePct: st.usagePct, detail: st.detail });
   } catch (e) {
     st.lastError = nowMs();
@@ -418,6 +428,7 @@ async function doProbe(p, cfg) {
     pushEvent(cfg, 'probe_failed', { name: p.name, status: st.status, err: String(e.message || e) });
     log(cfg, 'warn', 'probe failed', { name: p.name, status: st.status, err: String(e.message || e) });
   }
+  delete st._prev; // 成功/失败路径都要清理, 避免 _prev 字段泄漏进持久化状态
   st.updatedAt = nowMs();
   l1Set(p.name, p.url, st);
   await putState(st, cfg);
@@ -527,12 +538,24 @@ async function buildCandidates(cfg, model, sticky) {
 // ─────────────────────────── 带内响应分类 ───────────────────────────
 
 function extractResetMs(text, headerRetryAfter) {
-  let retryAfterS = headerRetryAfter ? parseInt(headerRetryAfter, 10) : 0;
+  let retryAfterS = 0;
+  if (headerRetryAfter) {
+    const n = Number(headerRetryAfter);
+    if (Number.isFinite(n) && n >= 0) {
+      retryAfterS = n;
+    } else {
+      // RFC 7231 允许 Retry-After 为 HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT"):
+      // parseInt 会得 NaN 丢掉信息, 这里换算成相对秒数
+      const d = Date.parse(headerRetryAfter);
+      if (Number.isFinite(d)) retryAfterS = Math.max(0, Math.ceil((d - nowMs()) / 1000));
+    }
+  }
   let reset = 0;
   if (text) {
     // proxy 的 RateLimitError message: "reset at 2026-08-18T07:00:00Z" / "retry after 30s"
     // (RFC3339 可能带毫秒: 2026-08-18T07:00:00.123Z)
-    const mReset = text.match(/reset at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+(?:\.\d+)?(?:Z|[+-][0-9:]+))/i);
+    // 年份限 19xx/20xx: 排除 Go 零值 "0001-01-01T00:00:00Z" 之类无意义时间
+    const mReset = text.match(/reset at\s+((?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]+(?:\.\d+)?(?:Z|[+-][0-9:]+))/i);
     if (mReset) reset = parseTs(mReset[1]);
     const mRetry = text.match(/retry after\s+([0-9]+)\s*s/i);
     if (mRetry && !retryAfterS) retryAfterS = parseInt(mRetry[1], 10);
@@ -572,16 +595,16 @@ async function recordFailure(st, kind, cfg, extra) {
   st.lastError = now;
   st.consecutiveErrors++;
   st.requestsFail++;
-  st.updatedAt = now; // 带内失败 = 新鲜的状态信号
   switch (kind) {
     case 'quota':
       st.status = 'depleted';
       st.reason = extra.code === 'out_of_credits' ? 'out_of_credits' : 'rate_limited';
       st.retryAfter = extra.retryAfterS || 0;
-      if (extra.reset) st.resetAt = extra.reset;
+      if (extra.reset > now) st.resetAt = extra.reset; // 过去的 reset 时间无意义, 不记录
       st.detail = extra.code + ' from proxy (retryAfter=' + (extra.retryAfterS || '?') + 's)';
-      // 恢复探测: resetAt+10s (若已知), 否则退避
-      if (extra.reset) {
+      // 恢复探测: resetAt+10s (仅当 reset 在未来), 否则退避 —— 过去/零值的 reset
+      // 若直接对齐会让 nextProbe 落进过去 → 每次请求立即重探/重试风暴
+      if (extra.reset > now) {
         st.nextProbe = extra.reset + 10 * 1000;
       } else {
         st.backoff = Math.min(cfg.depletedProbe, st.backoff * 2);
@@ -642,7 +665,12 @@ async function forward(req, targetUrl, proxyCfg, cfg, body, signal) {
   const headers = buildUpstreamHeaders(req, proxyCfg);
   headers.set('Content-Type', req.headers.get('content-type') || 'application/json');
   const init = { method: req.method, headers, signal };
-  if (body !== null) init.body = body;
+  if (body !== null) {
+    init.body = body;
+    // ReadableStream 请求体在标准 fetch (Node undici 等) 下要求 duplex: 'half'
+    // (Cloudflare Workers 无此要求, 带上无副作用); ArrayBuffer/Uint8Array 不需要
+    if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) init.duplex = 'half';
+  }
   const res = await fetch(targetUrl, init);
   return res;
 }
@@ -694,7 +722,7 @@ function aggregateError(attempts, cfg) {
   if (surfaces.length) {
     // 客户端请求错误(400/404 等): 原样透传第一个
     const s = surfaces[0];
-    return { passthrough: true, resp: s.resp, text: s.text };
+    return { passthrough: true, resp: s.resp, text: s.text, name: s.name };
   }
   if (banned) {
     return { error: errorResponse(403, 'account_banned',
@@ -725,11 +753,21 @@ function aggregateError(attempts, cfg) {
 
 // ─────────────────────────── 主处理: chat / 通用转发 ───────────────────────────
 
-async function routeRequest(req, cfg, body) {
+async function routeRequest(req, cfg, body, opts = {}) {
   const url = new URL(req.url);
   const model = extractModel(req, body);
-  const sticky = stickyKeyFor(req, cfg);
+  // noSticky: 内部请求 (smoke 等) 不读/不写钉住, 避免把管理会话的 key 钉进客户端 pin 空间
+  const sticky = opts.noSticky ? null : stickyKeyFor(req, cfg);
   const isChat = req.method === 'POST' && (url.pathname === '/v1/chat/completions');
+  // 判断是否流式请求: 只有缓冲的 JSON body 能可靠判断 (stream:true)。非 JSON 透传 body
+  // (ReadableStream) 无法解析 → 按非流式处理, 超时窗口只覆盖响应头等待阶段, 不影响透传流。
+  let chatStream = false;
+  if (isChat && body && !(body instanceof ReadableStream)) {
+    try {
+      const j = JSON.parse(new TextDecoder().decode(body));
+      if (j && j.stream === true) chatStream = true;
+    } catch (e) {}
+  }
 
   const { order, states } = await buildCandidates(cfg, model, sticky);
   if (order.length === 0) {
@@ -742,7 +780,14 @@ async function routeRequest(req, cfg, body) {
   const onClientAbort = () => ac.abort();
   req.signal.addEventListener('abort', onClientAbort, { once: true });
 
-  const max = Math.min(cfg.maxAttempts, order.length);
+  // 非流式 chat 才有单次尝试超时: 流式响应由客户端断开兜底 (流一旦开始不能由网关截断)。
+  // 这是"客户端 abort 不再误标 down"后, 挂死 proxy (接受连接但不响应) 的唯一带内检测 ——
+  // 超时 → 视作 down → failover, 而不是让每次请求挂到客户端超时。
+  // 注意: 超时窗口只覆盖"等待上游响应头"阶段, 头到达后计时器立即清除 —— 真正的 SSE
+  // 流头会立刻到达, 不会被截断; 无法解析的透传 body 也适用 (noReplay 单次尝试, 同样受益)。
+  const attemptTimeout = isChat && !chatStream ? cfg.chatTimeout : 0;
+
+  const max = opts.noReplay ? 1 : Math.min(cfg.maxAttempts, order.length);
   for (let i = 0; i < max; i++) {
     const st = order[i];
     // 转发一律用配置里的 url/apiKey (st.url 只是展示信息, 避免跨实例串状态)
@@ -750,16 +795,39 @@ async function routeRequest(req, cfg, body) {
     if (!pc) continue;
     const target = pc.url + url.pathname + url.search;
     const started = nowMs();
+    // 单次尝试超时信号: 与客户端 abort 叠加 (客户端断开仍优先 → 499)
+    let attemptCtrl = null, attemptTimer = null, onAttemptAbort = null;
+    let signal = ac.signal;
+    if (attemptTimeout > 0) {
+      attemptCtrl = new AbortController();
+      attemptTimer = setTimeout(() => attemptCtrl.abort(), attemptTimeout);
+      onAttemptAbort = () => attemptCtrl.abort();
+      ac.signal.addEventListener('abort', onAttemptAbort, { once: true });
+      signal = attemptCtrl.signal;
+    }
     let resp;
     try {
-      resp = await forward(req, target, pc, cfg, body, ac.signal);
+      resp = await forward(req, target, pc, cfg, body, signal);
     } catch (e) {
+      // 客户端断开: abort 会传播到上游 fetch, 以 AbortError 抛到这里。
+      // 必须先判 abort —— 客户端中断与 proxy 健康无关, 绝不能把健康 proxy 标 down
+      // (否则一次客户端取消就把 proxy 踢出选路池 120s+, 恢复探测前一直不可用)。
+      if (ac.signal.aborted) return errorResponse(499, 'client_closed', 'client disconnected', {});
+      // 网关侧单次尝试超时 (proxy 挂死: 连接建立但迟迟不响应) → 视作 down 并 failover
+      if (attemptCtrl && attemptCtrl.signal.aborted) {
+        await recordFailure(st, 'down', cfg, { status: 0, code: 'timeout', text: 'upstream timeout after ' + attemptTimeout + 'ms' });
+        attempts.push({ name: st.name, kind: 'down', text: 'upstream timeout after ' + attemptTimeout + 'ms' });
+        log(cfg, 'warn', 'upstream timeout', { name: st.name, ms: attemptTimeout });
+        continue;
+      }
       // 网络层错误
       await recordFailure(st, 'down', cfg, { status: 0, text: String(e.message || e) });
       attempts.push({ name: st.name, kind: 'down', text: String(e.message || e) });
       log(cfg, 'warn', 'upstream fetch failed', { name: st.name, err: String(e.message || e) });
-      if (ac.signal.aborted) return errorResponse(499, 'client_closed', 'client disconnected', {});
       continue;
+    } finally {
+      if (attemptTimer) clearTimeout(attemptTimer);
+      if (onAttemptAbort) ac.signal.removeEventListener('abort', onAttemptAbort);
     }
 
     const cl = await classify(resp);
@@ -819,7 +887,9 @@ async function routeRequest(req, cfg, body) {
     ok: false,
   });
   if (agg.passthrough) {
-    const h = passthroughHeaders(agg.resp, attempts[0].name);
+    // x-gateway-proxy 必须指实际产生该 surface 响应的 proxy —— 前面可能已尝试过
+    // 5xx/quota 的 proxy (attempts[0] 不一定是 surface 那个), 用 agg.name。
+    const h = passthroughHeaders(agg.resp, agg.name);
     for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
     return new Response(agg.text, { status: agg.resp.status, headers: h });
   }
@@ -842,12 +912,20 @@ async function handleModels(req, cfg) {
   const results = await Promise.allSettled(cfg.proxies.map(async p => {
     const st = await ensureFresh(p, cfg, {});
     const url = p.url + '/v1/models';
-    const res = await fetch(url, {
-      headers: { Authorization: 'Bearer ' + p.apiKey },
-    });
-    if (res.status !== 200) throw new Error(p.name + ': /v1/models HTTP ' + res.status);
-    const j = await res.json();
-    return { name: p.name, ok: st.status === 'ok', data: Array.isArray(j.data) ? j.data : [] };
+    // 与 doProbe 一致的上游超时: 挂死的 proxy 不能无限卡住 /v1/models 与后台模型下拉
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), cfg.probeTimeout);
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: 'Bearer ' + p.apiKey },
+        signal: ctrl.signal,
+      });
+      if (res.status !== 200) throw new Error(p.name + ': /v1/models HTTP ' + res.status);
+      const j = await res.json();
+      return { name: p.name, ok: st.status === 'ok', data: Array.isArray(j.data) ? j.data : [] };
+    } finally {
+      clearTimeout(to);
+    }
   }));
 
   const byModel = new Map();
@@ -1038,6 +1116,7 @@ async function applyRuntimeConfig(cfg) {
   if (Array.isArray(rc.proxies) && rc.proxies.length > 0) {
     try {
       const seen = new Set();
+      const seenUrls = new Set();
       cfg.proxies = rc.proxies.map((p, i) => {
         const url = String(p.url || '').replace(/\/+$/, '');
         if (!/^https?:\/\/[^/]+/.test(url)) throw new Error('proxy #' + (i + 1) + ': invalid url');
@@ -1045,6 +1124,9 @@ async function applyRuntimeConfig(cfg) {
         const name = String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1);
         if (seen.has(name)) throw new Error('duplicate proxy name ' + name);
         seen.add(name);
+        // 与 env 解析一致: 同一 URL 两个 name 会导致双倍探测、双倍消耗探测额度
+        if (seenUrls.has(url)) throw new Error('proxy #' + (i + 1) + ': duplicate url ' + url);
+        seenUrls.add(url);
         return { name, url, apiKey: String(p.apiKey) };
       });
       cfg.runtimeProxies = true;
@@ -1062,6 +1144,7 @@ async function applyRuntimeConfig(cfg) {
     if (Number.isFinite(s.depletedProbe) && s.depletedProbe >= 60) cfg.depletedProbe = Math.floor(s.depletedProbe);
     if (Number.isFinite(s.downProbe) && s.downProbe >= 30) cfg.downProbe = Math.floor(s.downProbe);
     if (Number.isFinite(s.probeTimeout) && s.probeTimeout >= 500) cfg.probeTimeout = Math.floor(s.probeTimeout);
+    if (Number.isFinite(s.chatTimeout) && s.chatTimeout >= 1000) cfg.chatTimeout = Math.floor(s.chatTimeout);
     if (Number.isFinite(s.maxAttempts) && s.maxAttempts >= 1 && s.maxAttempts <= 6) cfg.maxAttempts = Math.floor(s.maxAttempts);
   }
   return cfg;
@@ -1130,6 +1213,8 @@ async function adminOverview(cfg) {
     detail: st.detail || '',
     score: st.score,
     usage_pct: st.usagePct,
+    daily_limit: st.dailyLimit || null,
+    messages_24h: st.messages24h || null,
     risk: st.risk || null,
     cooldown_until: st.cooldownUntil ? new Date(st.cooldownUntil).toISOString() : null,
     reset_at: st.resetAt ? new Date(st.resetAt).toISOString() : null,
@@ -1172,6 +1257,7 @@ async function adminConfig(cfg) {
       depleted_probe: cfg.depletedProbe,
       down_probe: cfg.downProbe,
       probe_timeout: cfg.probeTimeout,
+      chat_timeout: cfg.chatTimeout,
       max_attempts: cfg.maxAttempts,
       admin_uses_api_key: !cfg.adminKeyConfigured, // ADMIN_KEY 未配置时管理后台复用 API_KEY
       api_key_masked: cfg.clientKeys.map(maskKey).join(', '),
@@ -1180,6 +1266,7 @@ async function adminConfig(cfg) {
       // 来源标记
       runtime_managed: !!cfg.runtimeProxies,   // 代理列表来自后台运行时配置
       has_runtime_config: !!rc,                // 是否存在后台保存的运行时配置
+      runtime_error: cfg._runtimeError || null, // 运行时代理校验失败时的降级原因 (供设置页提示)
     },
   }), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 }
@@ -1188,12 +1275,15 @@ async function adminConfig(cfg) {
 async function adminSaveConfig(req, cfg) {
   let body = {};
   try { body = await req.json(); } catch (e) { return errorResponse(400, 'invalid_config', 'invalid JSON body', {}); }
-  const rc = {};
+  // 读-改-写合并: 后台"保存代理"与"保存参数"是两个独立表单, 各只 POST 自己的字段。
+  // 若整体替换会把另一部分清掉 (先存代理、再只改一个参数 → 代理列表静默回退环境变量)。
+  const rc = { ...((await getRuntimeConfig()) || {}) };
   if (body.proxies !== undefined) {
     if (!Array.isArray(body.proxies) || body.proxies.length === 0) {
       return errorResponse(400, 'invalid_config', 'proxies must be a non-empty array of {name?,url,apiKey}', {});
     }
     const seen = new Set();
+    const seenUrls = new Set();
     for (let i = 0; i < body.proxies.length; i++) {
       const p = body.proxies[i];
       const url = String(p.url || '').replace(/\/+$/, '');
@@ -1202,6 +1292,8 @@ async function adminSaveConfig(req, cfg) {
       const name = String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1);
       if (seen.has(name)) return errorResponse(400, 'invalid_config', 'duplicate proxy name: ' + name, {});
       seen.add(name);
+      if (seenUrls.has(url)) return errorResponse(400, 'invalid_config', 'proxy #' + (i + 1) + ': duplicate url: ' + url, {});
+      seenUrls.add(url);
     }
     rc.proxies = body.proxies.map((p, i) => ({
       name: String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1),
@@ -1215,19 +1307,22 @@ async function adminSaveConfig(req, cfg) {
     }
     const s = body.settings;
     if (s.pinMode !== undefined && !['client', 'header', 'off'].includes(s.pinMode)) return errorResponse(400, 'invalid_config', 'pinMode must be client|header|off', {});
-    for (const [k, min] of [['pinTtl', 60], ['stateTtl', 60], ['depletedProbe', 60], ['downProbe', 30], ['probeTimeout', 500]]) {
+    for (const [k, min] of [['pinTtl', 60], ['stateTtl', 60], ['depletedProbe', 60], ['downProbe', 30], ['probeTimeout', 500], ['chatTimeout', 1000]]) {
       if (s[k] !== undefined && (!Number.isFinite(s[k]) || s[k] < min)) return errorResponse(400, 'invalid_config', k + ' must be >= ' + min, {});
     }
     if (s.maxAttempts !== undefined && (!Number.isFinite(s.maxAttempts) || s.maxAttempts < 1 || s.maxAttempts > 6)) return errorResponse(400, 'invalid_config', 'maxAttempts must be 1-6', {});
-    rc.settings = {
-      ...(s.pinMode !== undefined ? { pinMode: s.pinMode } : {}),
-      ...(s.pinTtl !== undefined ? { pinTtl: Math.floor(s.pinTtl) } : {}),
-      ...(s.stateTtl !== undefined ? { stateTtl: Math.floor(s.stateTtl) } : {}),
-      ...(s.depletedProbe !== undefined ? { depletedProbe: Math.floor(s.depletedProbe) } : {}),
-      ...(s.downProbe !== undefined ? { downProbe: Math.floor(s.downProbe) } : {}),
-      ...(s.probeTimeout !== undefined ? { probeTimeout: Math.floor(s.probeTimeout) } : {}),
-      ...(s.maxAttempts !== undefined ? { maxAttempts: Math.floor(s.maxAttempts) } : {}),
-    };
+    // 读-改-写合并 (与 proxies 同一策略): 只覆盖请求里出现的字段, 绝不整体替换。
+    // 否则一次只传 {pinMode} 的部分保存会静默丢掉之前保存的 maxAttempts 等其它参数。
+    const merged = { ...((rc.settings && typeof rc.settings === 'object') ? rc.settings : {}) };
+    if (s.pinMode !== undefined) merged.pinMode = s.pinMode;
+    if (s.pinTtl !== undefined) merged.pinTtl = Math.floor(s.pinTtl);
+    if (s.stateTtl !== undefined) merged.stateTtl = Math.floor(s.stateTtl);
+    if (s.depletedProbe !== undefined) merged.depletedProbe = Math.floor(s.depletedProbe);
+    if (s.downProbe !== undefined) merged.downProbe = Math.floor(s.downProbe);
+    if (s.probeTimeout !== undefined) merged.probeTimeout = Math.floor(s.probeTimeout);
+    if (s.chatTimeout !== undefined) merged.chatTimeout = Math.floor(s.chatTimeout);
+    if (s.maxAttempts !== undefined) merged.maxAttempts = Math.floor(s.maxAttempts);
+    rc.settings = merged;
   }
   if (!rc.proxies && !rc.settings) return errorResponse(400, 'invalid_config', 'nothing to save (provide proxies and/or settings)', {});
   await setRuntimeConfig(rc);
@@ -1285,10 +1380,12 @@ async function adminPin(req, cfg) {
   try { body = await req.json(); } catch (e) {}
   const key = String(body.key || '').trim();
   if (!key) return errorResponse(400, 'invalid_request', 'key is required', {});
-  const sticky = (cfg.pinMode === 'header' ? 'h:' : 'c:') + key;
-  try {
-    await caches.default.delete(pinKey(sticky));
-  } catch (e) {}
+  // 当前模式用单前缀; PIN_MODE=off 无活动命名空间, 清除时同时覆盖 c:/h:,
+  // 让"清除"在模式切换后仍能清掉旧模式遗留的 pin (否则旧 pin 只能等 TTL 过期)
+  const prefixes = cfg.pinMode === 'off' ? ['c:', 'h:'] : [(cfg.pinMode === 'header' ? 'h:' : 'c:')];
+  for (const pre of prefixes) {
+    try { await caches.default.delete(pinKey(pre + key)); } catch (e) {}
+  }
   pushEvent(cfg, 'admin_action', { action: 'clear_pin', key });
   return new Response(JSON.stringify({ cleared: true, key }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
@@ -1340,7 +1437,10 @@ async function adminSmoke(req, cfg) {
   });
   const started = nowMs();
   try {
-    const resp = await routeRequest(inner, cfg, new TextEncoder().encode(chatBody));
+    // noSticky: smoke 是内部测试请求, 若带 sticky 会把管理会话的 key (可能只是 ADMIN_KEY,
+    // 甚至默认未配 ADMIN_KEY 时就是真实客户端的 API_KEY) 钉进客户端 pin 空间,
+    // 污染真实客户端的路由 (ADMIN_KEY 场景下还产生永远无人使用的 c:<adminKey> pin)。
+    const resp = await routeRequest(inner, cfg, new TextEncoder().encode(chatBody), { noSticky: true });
     // 读响应 (有界 256KB, smoke 是测试请求), 解析成人类可读内容
     let raw = '';
     if (resp.body) {
@@ -1503,8 +1603,13 @@ export default {
       return errorResponse(401, 'invalid_api_key', 'Invalid gateway API key. Send it as Authorization: Bearer <API_KEY> or X-API-Key.', {});
     }
 
-    // 请求体缓冲 (为 failover 重放; 限制 32MB, 与 proxy 一致)
+    // 请求体缓冲 (为 failover 重放; 限制 32MB, 与 proxy 一致)。
+    // json/text 缓冲为可重放的 ArrayBuffer; 其余类型 (multipart/octet-stream/ndjson 等)
+    // 原样透传 request.body 流 —— 之前这里留 null 会让 proxy 收到一个空 body 的 POST,
+    // 客户端数据被静默丢弃 (README 声称"原样转发但无法重放"但代码根本没转发)。
+    // 流不可重放: 首次尝试失败后不再 failover (与文档取舍一致)。
     let body = null;
+    let bodyNoReplay = false;
     if (request.method === 'POST' || request.method === 'PUT' || request.method === 'PATCH') {
       const ct = request.headers.get('content-type') || '';
       if (ct.includes('application/json') || ct.includes('text/')) {
@@ -1517,6 +1622,16 @@ export default {
         } catch (e) {
           return errorResponse(400, 'invalid_request', 'failed to read request body: ' + e.message, {});
         }
+      } else if (request.body) {
+        // 流式 body 无法预读判大小: 有 content-length 时做廉价预检 (拒绝明显超限),
+        // 与 json/text 缓冲路径的 32MB 限制一致; 无长度 (chunked) 时只能依赖边缘/上游限制
+        // —— 为了判大小而缓冲会破坏"原样透传"语义 (权衡已写入 README)。
+        const cl = Number(request.headers.get('content-length'));
+        if (Number.isFinite(cl) && cl > 32 * 1024 * 1024) {
+          return errorResponse(413, 'content_too_large', 'request body exceeds the 32MB limit', {});
+        }
+        body = request.body;   // 原样透传 (只尝试一次, 不重放)
+        bodyNoReplay = true;
       }
     }
 
@@ -1524,6 +1639,6 @@ export default {
       return handleModels(request, cfg);
     }
 
-    return routeRequest(request, cfg, body);
+    return routeRequest(request, cfg, body, { noReplay: bodyNoReplay });
   },
 };

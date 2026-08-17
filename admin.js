@@ -358,6 +358,9 @@ function proxyCard(pr){
 }
 function renderProxies(d){
   var el=$("#view-proxies");
+  // 每次进入代理页都作废已缓存的完整配置: 编辑/删除提交必须基于最新列表。
+  // 否则多管理员场景下, 另一人新加的代理会因陈旧缓存被静默丢弃 (loadCfgProxies 重新拉取)。
+  _cfgProxiesLoaded=false;
   // 防抖: 数据无变化时跳过整页重建 (轮询 5s 触发, 避免界面跳变/闪烁)
   var sig=JSON.stringify((d.proxies||[]).map(function(p){
     return [p.name,p.status,p.maint,p.score,p.requestsOk,p.requestsFail,p.detail,p.last_ok,p.next_probe];
@@ -376,10 +379,8 @@ function renderProxies(d){
   var cardsEl=el.querySelector(".proxy-cards");
   if(!d.proxies.length)cardsEl.innerHTML='<div class="card"><div class="empty">未配置任何代理</div></div>';
   d.proxies.forEach(function(pr){cardsEl.insertAdjacentHTML("beforeend",proxyCard(pr))});
-  // 加载完整配置 (含 apiKey) 供编辑
-  api("/config").then(function(cd){
-    _cfgProxies=(cd.config&&cd.config.proxies||[]).slice();
-  }).catch(function(){});
+  // 加载完整配置 (含 apiKey) 供编辑; 失败静默 (编辑/删除时会经 loadCfgProxies 重试)
+  loadCfgProxies().catch(function(){});
   refreshPinBanner();
   // 直接为每个卡片绑定事件 (比事件委托更可靠, 避免代理名/嵌套导致 closest 失效)
   el.querySelectorAll(".proxy").forEach(function(card){
@@ -410,15 +411,26 @@ function renderProxies(d){
     };
     card.querySelector(".p-edit").onclick=function(e){
       e.preventDefault();e.stopPropagation();
-      var p=_cfgProxies.find(function(x){return x.name===name})||{name:name,url:card.querySelector(".proxy-url").innerText,apiKey:""};
-      _pmEditingName=p.name;
-      openProxyModal(p);
+      // 编辑必须基于完整配置 (apiKey 回填); /config 未返回时先等它 (竞态保护)
+      loadCfgProxies().then(function(list){
+        var p=list.find(function(x){return x.name===name})||{name:name,url:card.querySelector(".proxy-url").innerText,apiKey:""};
+        _pmEditingName=p.name;
+        openProxyModal(p);
+      }).catch(function(){
+        // /config 都拿不到时用卡片上的展示数据兜底 (apiKey 留空, 保存时需补填)
+        var p={name:name,url:card.querySelector(".proxy-url").innerText,apiKey:""};
+        _pmEditingName=p.name;
+        openProxyModal(p);
+      });
     };
     card.querySelector(".p-del").onclick=function(e){
       e.preventDefault();e.stopPropagation();
       if(!confirm("确定删除代理 "+name+" ?"))return;
-      var list=_cfgProxies.filter(function(x){return x.name!==name});
-      saveProxies(list,"代理已删除");
+      // 关键: 删除必须基于完整配置列表。若 /config 尚未返回 (异步竞态), _cfgProxies
+      // 为空 → 会提交空列表 → 后端 400 且删除静默失败。loadCfgProxies 保证取到才删。
+      loadCfgProxies().then(function(list){
+        saveProxies(list.filter(function(x){return x.name!==name}),"代理已删除");
+      }).catch(function(){toast("删除失败: 无法加载代理配置")});
     };
   });
   $("#addProxyBtn").onclick=function(){openProxyModal(null)};
@@ -580,10 +592,12 @@ function toCustomModel(sel){
 function renderSettings(d){
   var el=$("#view-settings");
   var c=d.config||{};
-  _cfgProxies=(c.proxies||[]).slice();
-  var srcNote=c.has_runtime_config
-    ? '配置来源: <b>后台运行时配置</b> (用户改动优先; 环境变量为初始值, 部署后仍以这里为准)'
-    : '配置来源: <b>环境变量</b> (默认值内置于代码)';
+  _cfgProxies=(c.proxies||[]).slice();_cfgProxiesLoaded=true;
+  var srcNote=c.runtime_error
+    ? '配置来源: <b>后台运行时配置</b> — 代理校验失败已回退环境变量: <span style="color:var(--red)">'+esc(c.runtime_error)+'</span>'
+    : (c.has_runtime_config
+      ? '配置来源: <b>后台运行时配置</b> (用户改动优先; 环境变量为初始值, 部署后仍以这里为准)'
+      : '配置来源: <b>环境变量</b> (默认值内置于代码)');
   var authRows='';
   if(c.admin_uses_api_key){
     authRows='<div class="cell"><div class="cell-label">API_KEY / 管理后台鉴权</div><div class="cell-value mono" style="font-size:12px">'+esc(c.api_key_masked)+"</div></div>"+
@@ -604,6 +618,7 @@ function renderSettings(d){
     '<div class="field"><label>DEPLETED_PROBE 耗尽探测退避 (秒, ≥60)</label><input class="input" id="sDepletedProbe" type="number" min="60" value="'+esc(c.depleted_probe)+'"></div>'+
     '<div class="field"><label>DOWN_PROBE 故障探测退避 (秒, ≥30)</label><input class="input" id="sDownProbe" type="number" min="30" value="'+esc(c.down_probe)+'"></div>'+
     '<div class="field"><label>PROBE_TIMEOUT 探测超时 (毫秒, ≥500)</label><input class="input" id="sProbeTimeout" type="number" min="500" value="'+esc(c.probe_timeout)+'"></div>'+
+    '<div class="field"><label>CHAT_TIMEOUT 非流式聊天超时 (毫秒, ≥1000; 流式不受限)</label><input class="input" id="sChatTimeout" type="number" min="1000" value="'+esc(c.chat_timeout)+'"></div>'+
     '<div class="field"><label>MAX_ATTEMPTS 最大尝试次数 (1-6)</label><input class="input" id="sMaxAttempts" type="number" min="1" max="6" value="'+esc(c.max_attempts)+'"></div>'+
     '<div style="display:flex;gap:8px"><button class="btn" id="sSave" style="flex:1">保存参数</button>'+
     (c.has_runtime_config?'<button class="btn danger" id="sReset" style="flex:1">恢复环境变量</button>':'')+'</div>'+
@@ -632,6 +647,7 @@ function renderSettings(d){
       depletedProbe:parseInt($("#sDepletedProbe").value,10),
       downProbe:parseInt($("#sDownProbe").value,10),
       probeTimeout:parseInt($("#sProbeTimeout").value,10),
+      chatTimeout:parseInt($("#sChatTimeout").value,10),
       maxAttempts:parseInt($("#sMaxAttempts").value,10)
     };
     api("/config",{method:"POST",body:JSON.stringify({settings:settings})}).then(function(){
@@ -661,6 +677,18 @@ function noop(){}
 function maskKey(k){if(!k)return"—";if(String(k).length<=6)return String(k)[0]+"***";var s=String(k);return s.slice(0,3)+"…"+s.slice(-3)}
 /* ── 代理管理 (添加/编辑/删除) ── */
 var _cfgProxies=[]; // 当前生效代理 (含 apiKey), 来自 /admin/api/config
+var _cfgProxiesLoaded=false; // /config 是否已成功加载过 (编辑/删除依赖完整列表)
+// 编辑/删除必须先拿到完整配置 (含 apiKey): 渲染代理页时 /config 是异步填充的,
+// 若用户立刻点"编辑/删除"而 /config 未返回, _cfgProxies 为空 → 编辑丢 apiKey、
+// 删除提交空列表被后端 400 拒绝 (静默失败)。这里统一保证"取到才继续"。
+function loadCfgProxies(){
+  if(_cfgProxiesLoaded)return Promise.resolve(_cfgProxies);
+  return api("/config").then(function(cd){
+    _cfgProxies=(cd.config&&cd.config.proxies||[]).slice();
+    _cfgProxiesLoaded=true;
+    return _cfgProxies;
+  });
+}
 function openProxyModal(p){
   $("#pmTitle").textContent=p?"编辑代理 "+p.name:"添加代理";
   $("#pmName").value=p?p.name:"";
@@ -673,7 +701,7 @@ function openProxyModal(p){
 function closeProxyModal(){$("#proxyModal").classList.remove("show")}
 function saveProxies(list,msg){
   api("/config",{method:"POST",body:JSON.stringify({proxies:list})}).then(function(){
-    toast(msg||"已保存");_cfgProxies=list.slice();closeProxyModal();refresh();
+    toast(msg||"已保存");_cfgProxies=list.slice();_cfgProxiesLoaded=true;closeProxyModal();refresh();
   }).catch(function(e){toast("保存失败: "+e.message)});
 }
 function submitProxyForm(){

@@ -61,7 +61,7 @@ const fakeConfig = {
       { name: 'proxy-c', url: 'https://proxy-c.runsite.app', apiKey: 'gw-key-333' },
     ],
     pin_mode: 'client', pin_ttl: 3600, state_ttl: 60, depleted_probe: 300, down_probe: 120,
-    probe_timeout: 3000, max_attempts: 3,
+    probe_timeout: 3000, chat_timeout: 120000, max_attempts: 3,
     admin_uses_api_key: true, admin_key_masked: null,
     api_key_masked: 'cli…789, cli…012', proxy_keys_masked: 'gw…111, gw…222, gw…333',
     runtime_managed: false, has_runtime_config: false,

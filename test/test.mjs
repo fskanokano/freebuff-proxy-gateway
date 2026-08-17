@@ -39,12 +39,15 @@ const allProxies = [];
 //   usagePct, cooldownUntilMs, quota:{model:{limit,recentCount,resetAtMs}},
 //   fail:{status,code,retryAfter,body} | null,
 //   mode:'sse'|'json'|'abort' (abort=发一块后挂住等断开),
-//   healthzStatus/healthzBody/healthzDelay (探测异常注入)
+//   healthzStatus/healthzBody/healthzDelay (探测异常注入),
+//   chatDelay/modelsDelay (响应延迟注入, 测上游超时/客户端中断),
+//   lastBody (最近一次 chat 收到的原始 body, 断言请求体透传)
 export function makeProxy(name) {
   const ctl = {
     name, usagePct: 0, cooldownUntilMs: 0, quota: {}, fail: null, mode: 'sse',
     healthzStatus: 200, healthzBody: null, healthzDelay: 0,
-    chatHits: 0, healthzHits: 0, modelsHits: 0, lastModel: null,
+    chatDelay: 0, modelsDelay: 0,
+    chatHits: 0, healthzHits: 0, modelsHits: 0, lastModel: null, lastBody: '',
     lastAuth: '', healthzLastAuth: '', clientAborted: false, streamStarted: false,
   };
   const port = ++portCounter;
@@ -74,10 +77,15 @@ export function makeProxy(name) {
     }
     if (url.pathname === '/v1/models') {
       ctl.modelsHits++;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ object: 'list', data: [
-        { id: 'freebuff-1', object: 'model', created: 1, owned_by: 'freebuff', available: ctl.usagePct < 100, status: ctl.usagePct < 100 ? 'available' : 'quota_exhausted' },
-      ] }));
+      const send = () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [
+          { id: 'freebuff-1', object: 'model', created: 1, owned_by: 'freebuff', available: ctl.usagePct < 100, status: ctl.usagePct < 100 ? 'available' : 'quota_exhausted' },
+        ] }));
+      };
+      // modelsDelay: 超过网关 probeTimeout 才响应 (测 /v1/models 上游超时中止)
+      if (ctl.modelsDelay > 0) setTimeout(() => { try { send(); } catch (e) {} }, ctl.modelsDelay);
+      else send();
       return;
     }
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
@@ -86,41 +94,47 @@ export function makeProxy(name) {
       let raw = '';
       req.on('data', d => { raw += d; });
       req.on('end', () => {
+        ctl.lastBody = raw;
         try { ctl.lastModel = JSON.parse(raw).model; } catch (e) {}
-        if (ctl.fail) {
-          res.writeHead(ctl.fail.status, {
-            'Content-Type': 'application/json',
-            ...(ctl.fail.retryAfter ? { 'Retry-After': String(ctl.fail.retryAfter) } : {}),
-          });
-          res.end(JSON.stringify({ error: { code: ctl.fail.code, message: ctl.fail.body || 'failed', type: 'upstream_error' } }));
-          return;
-        }
-        if (ctl.mode === 'abort') {
-          ctl.streamStarted = true;
-          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-          res.write('data: {"choices":[{"delta":{"content":"part1"}}]}\n\n');
-          res.on('close', () => { if (!res.writableEnded) ctl.clientAborted = true; });
-          setTimeout(() => { try { res.end('data: [DONE]\n\n'); } catch (e) {} }, 60000);
-          return;
-        }
-        if (ctl.mode === 'sse') {
-          ctl.streamStarted = true;
-          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-          const chunks = [
-            'data: {"id":"cmpl-1","object":"chat.completion.chunk","model":"freebuff-1","choices":[{"delta":{"role":"assistant","content":"Hel"}}]}\n\n',
-            'data: {"id":"cmpl-1","object":"chat.completion.chunk","model":"freebuff-1","choices":[{"delta":{"content":"lo"}}]}\n\n',
-            'data: [DONE]\n\n',
-          ];
-          let i = 0;
-          const tick = () => {
-            if (i < chunks.length) { res.write(chunks[i++]); setTimeout(tick, 5); }
-            else res.end();
-          };
-          tick();
-        } else {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ id: 'cmpl-1', object: 'chat.completion', model: 'freebuff-1', choices: [{ message: { role: 'assistant', content: 'Hello from ' + name }, finish_reason: 'stop' }] }));
-        }
+        const respond = () => {
+          if (ctl.fail) {
+            res.writeHead(ctl.fail.status, {
+              'Content-Type': 'application/json',
+              ...(ctl.fail.retryAfter ? { 'Retry-After': String(ctl.fail.retryAfter) } : {}),
+            });
+            res.end(JSON.stringify({ error: { code: ctl.fail.code, message: ctl.fail.body || 'failed', type: 'upstream_error' } }));
+            return;
+          }
+          if (ctl.mode === 'abort') {
+            ctl.streamStarted = true;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+            res.write('data: {"choices":[{"delta":{"content":"part1"}}]}\n\n');
+            res.on('close', () => { if (!res.writableEnded) ctl.clientAborted = true; });
+            setTimeout(() => { try { res.end('data: [DONE]\n\n'); } catch (e) {} }, 60000);
+            return;
+          }
+          if (ctl.mode === 'sse') {
+            ctl.streamStarted = true;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+            const chunks = [
+              'data: {"id":"cmpl-1","object":"chat.completion.chunk","model":"freebuff-1","choices":[{"delta":{"role":"assistant","content":"Hel"}}]}\n\n',
+              'data: {"id":"cmpl-1","object":"chat.completion.chunk","model":"freebuff-1","choices":[{"delta":{"content":"lo"}}]}\n\n',
+              'data: [DONE]\n\n',
+            ];
+            let i = 0;
+            const tick = () => {
+              if (i < chunks.length) { res.write(chunks[i++]); setTimeout(tick, 5); }
+              else res.end();
+            };
+            tick();
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ id: 'cmpl-1', object: 'chat.completion', model: 'freebuff-1', choices: [{ message: { role: 'assistant', content: 'Hello from ' + name }, finish_reason: 'stop' }] }));
+          }
+        };
+        // chatDelay: 延迟响应 (测"客户端在响应前断开"路径: 上游 fetch 在途时 abort)
+        if (ctl.chatDelay > 0) setTimeout(() => { try { respond(); } catch (e) {} }, ctl.chatDelay);
+        else respond();
       });
       return;
     }
@@ -833,6 +847,12 @@ await t('FO12 客户端中途断开 → 上游请求被中止', async () => {
 });
 
 await t('FO13 探测失败时退避递增并封顶 (DEPLETED_PROBE_SECONDS)', async () => {
+  // 固定抖动=0: nextProbe 精确可断言。此前 jitter 随机符号与 cache TTL / L1 新鲜窗口
+  // 竞争 —— 首次 nextProbe 偏未来时不触发探测、持久化状态先过期 → down 塌缩成 fail-open
+  // 的 unknown, 断言 ~10% 概率失败 (suite 不可靠绿门)。
+  const origRandom = Math.random;
+  Math.random = () => 0.5;
+  try {
   const p1 = await makeProxy('f13a'); const p2 = await makeProxy('f13b');
   const [n1] = proxyNames([p1, p2]);
   // 先让 p1 变 down (chat 502), 之后 healthz 也持续失败 → 每次到期探测都失败 → backoff 递增
@@ -850,6 +870,7 @@ await t('FO13 探测失败时退避递增并封顶 (DEPLETED_PROBE_SECONDS)', as
   const gap = Date.parse(hz.next_probe) - Date.parse(hz.last_error);
   assert.ok(gap >= 50e3 && gap <= 70e3, 'probe gap should be ~60s (capped), got ' + gap);
   assert.ok(hz.consecutive_errors >= 2, 'consecutive failures should accumulate');
+  } finally { Math.random = origRandom; }
 });
 
 console.log('\n== 探测极端 ==');
@@ -1342,6 +1363,186 @@ await t('ADM18 低流量日志不滞留: 单次请求后路由/事件日志立�
   assert.ok(Array.isArray(ev) && ev.some(e => e.type === 'admin_action' && e.action === 'probe'), 'admin_action event visible: ' + JSON.stringify(ev));
 });
 
+console.log('\n== 隐藏 bug 回归 (审查修复) ==');
+
+await t('HZ1 /healthz 透传 daily_limit / messages_24h (探测解析字段落盘)', async () => {
+  const p = await makeProxy('hz1');
+  p.ctl.usagePct = 30; // mock healthz: Messages24h=6, DailyLimit=20
+  const env = envFor([p], { API_KEY: 't-hz1' });
+  const hz = await hzOf(env, proxyNames([p])[0]);
+  // BUG-A: parseHealthz 解析了 DailyLimit/Messages24h, 但 applyHealthz 从不写回 state
+  // → /healthz 的 daily_limit/messages_24h 永远 null。修复后必须透传。
+  assert.equal(hz.daily_limit, 20);
+  assert.equal(hz.messages_24h, 6);
+});
+
+await t('FO14 surface 透传 x-gateway-proxy 头指真实 surface proxy (先 5xx 后 400)', async () => {
+  const p1 = await makeProxy('f14a'); const p2 = await makeProxy('f14b');
+  p1.ctl.fail = { status: 502, code: 'boom', body: 'x' };
+  p2.ctl.fail = { status: 400, code: 'invalid_json', body: 'bad body' };
+  const env = envFor([p1, p2], { API_KEY: 't-f14' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-f14' }), env, {});
+  assert.equal(res.status, 400);
+  // BUG: 旧代码用 attempts[0].name (5xx 的 p1), body 却来自 surface 的 p2
+  assert.equal(res.headers.get('x-gateway-proxy'), proxyNames([p1, p2])[1]);
+});
+
+await t('FO15 429 body Go 零值时间 reset at 0001-... → 走退避, 不重探风暴', async () => {
+  const p1 = await makeProxy('f15a'); const p2 = await makeProxy('f15b');
+  const [n1] = proxyNames([p1, p2]);
+  // 无 Retry-After 头, body 只有 Go 零值时间 (旧 regex 会匹配到 0001-... 并被
+  // Date.parse 解析成巨大负数 → nextProbe 落进过去 → 每次请求立即重探/重试风暴)
+  p1.ctl.fail = { status: 429, code: 'rate_limited', body: 'upstream rate limited (reset at 0001-01-01T00:00:00Z)' };
+  const env = envFor([p1, p2], { API_KEY: 't-f15', DEPLETED_PROBE_SECONDS: '120' });
+  await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-f15' }), env, {});
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'depleted');
+  assert.equal(hz.reason, 'rate_limited');
+  assert.ok(Date.parse(hz.next_probe) > Date.now(), 'next_probe must be in the future, got ' + hz.next_probe);
+  assert.equal(hz.reset_at, null, 'zero-value reset must not be recorded');
+});
+
+await t('FO16 Retry-After HTTP-date 格式 → 换算为秒数对齐', async () => {
+  const p1 = await makeProxy('f16a'); const p2 = await makeProxy('f16b');
+  const [n1] = proxyNames([p1, p2]);
+  // RFC 7231 允许 HTTP-date ("Mon, 17 Aug 2026 00:02:00 GMT"); parseInt 得 NaN → 旧代码丢信息
+  const httpDate = new Date(Date.now() + 120e3).toUTCString();
+  p1.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: httpDate, body: 'x' };
+  const env = envFor([p1, p2], { API_KEY: 't-f16' });
+  await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-f16' }), env, {});
+  const hz = await hzOf(env, n1);
+  const delta = Date.parse(hz.next_probe) - Date.now();
+  // nextProbe ≈ now + 120s(Retry-After) + 10s(reset 缓冲)
+  assert.ok(delta > 120e3 && delta < 145e3, 'next_probe should align to HTTP-date retry-after +10s, delta=' + delta);
+});
+
+await t('FO17 客户端中途断开 → 不把健康 proxy 标 down (abort 先于 recordFailure)', async () => {
+  const p = await makeProxy('f17');
+  const [n1] = proxyNames([p]);
+  const env = envFor([p], { API_KEY: 't-f17' });
+  // 先确认 proxy 健康
+  let hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'ok');
+  // proxy 响应延迟 5s (上游 fetch 在途), 客户端在响应前断开
+  p.ctl.chatDelay = 5000;
+  const ctrl = new AbortController();
+  const req = new Request('https://gw.example/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer t-f17', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'freebuff-1', messages: [] }),
+    signal: ctrl.signal,
+  });
+  const resP = worker.fetch(req, env, {});
+  await new Promise(r => setTimeout(r, 150)); // 让请求到达上游 (在途)
+  ctrl.abort(); // 客户端断开
+  const res = await resP;
+  assert.equal(res.status, 499);
+  const j = await res.json();
+  assert.equal(j.error.code, 'client_closed');
+  // BUG: 旧代码先 recordFailure(down) 再判 abort → 健康 proxy 被踢出选路池 120s+
+  hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'ok');
+});
+
+await t('BODY8 非 JSON content-type → 请求体原样到达 proxy (multipart 不丢 body)', async () => {
+  const p = await makeProxy('b8');
+  const env = envFor([p], { API_KEY: 't-b8' });
+  const payload = '--boundary\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\n\r\nhello world\r\n--boundary--\r\n';
+  const res = await worker.fetch(new Request('https://gw.example/v1/chat/completions', { method: 'POST', headers: { Authorization: 'Bearer t-b8', 'Content-Type': 'multipart/form-data; boundary=boundary' }, body: payload }), env, {});
+  assert.equal(res.status, 200);
+  // BUG: 旧代码非 json/text 不缓冲 → body=null → proxy 收到空 body 的 POST, 数据全丢
+  assert.equal(p.ctl.lastBody, payload, 'upstream must receive the full request body');
+});
+
+await t('BODY9 透传 (非 json/text) body 带超大 content-length → 413 网关预检拒绝', async () => {
+  const p = await makeProxy('b9');
+  const env = envFor([p], { API_KEY: 't-b9' });
+  // multipart 走透传分支 (不缓冲): 声明 40MB content-length → 不读 body 也能廉价预检,
+  // 与 json/text 缓冲路径的 32MB 限制对齐 (旧代码透传分支无任何 413 保护)
+  const req = new Request('https://gw.example/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer t-b9', 'Content-Type': 'multipart/form-data; boundary=x' },
+    body: 'small',
+  });
+  req.headers.set('content-length', String(40 * 1024 * 1024));
+  const res = await worker.fetch(req, env, {});
+  assert.equal(res.status, 413);
+  assert.equal(p.ctl.chatHits, 0, 'proxy must not be hit for an over-limit body');
+});
+
+await t('MOD1 /v1/models 上游挂起 → probeTimeout 中止, 不无限卡住', async () => {
+  const p = await makeProxy('mod1');
+  p.ctl.modelsDelay = 5000; // 超过 probe timeout 才响应
+  const env = envFor([p], { API_KEY: 't-mod1', PROBE_TIMEOUT_MS: '500' });
+  const t0 = performance.now();
+  const res = await worker.fetch(gwReq('/v1/models', { method: 'GET', key: 't-mod1' }), env, {});
+  const elapsed = performance.now() - t0;
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.ok(Array.isArray(j.data), 'should still return a list');
+  // BUG: 旧代码 /v1/models fetch 无 AbortController/超时, 挂死的 proxy 会无限卡住
+  assert.ok(elapsed < 3000, 'models fetch should abort on timeout, took ' + Math.round(elapsed) + 'ms');
+});
+
+await t('CHAT1 非流式 chat 上游挂起 → CHAT_TIMEOUT_MS 中止并 failover (不挂到客户端超时)', async () => {
+  const p1 = await makeProxy('ch1a'); const p2 = await makeProxy('ch1b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.chatDelay = 2000; // 接受连接但不响应 (挂死)
+  const env = envFor([p1, p2], { API_KEY: 't-ch1', CHAT_TIMEOUT_MS: '1000', MAX_ATTEMPTS: '2' });
+  const t0 = performance.now();
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-ch1' }), env, {});
+  const elapsed = performance.now() - t0;
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n2, 'should fail over to the healthy proxy');
+  assert.equal(res.headers.get('x-gateway-attempts'), '2');
+  // 修复前: abort 前置后挂死的 proxy 不再被误标 down, 但也失去了唯一的带内挂起检测
+  // → 每次请求挂满客户端超时且无 failover。现在由网关超时主动判定并切换。
+  assert.ok(elapsed < 1500, 'should failover shortly after the 1000ms timeout, took ' + Math.round(elapsed) + 'ms');
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'down', 'hung proxy should be marked down by gateway timeout');
+  assert.equal(hz.reason, 'timeout');
+});
+
+await t('CHAT2 流式 chat 不受 CHAT_TIMEOUT 限制 (流由客户端断开兜底)', async () => {
+  const p = await makeProxy('ch2');
+  p.ctl.chatDelay = 1500; // 流式响应头部延迟 1.5s > CHAT_TIMEOUT 1000ms
+  const env = envFor([p], { API_KEY: 't-ch2', CHAT_TIMEOUT_MS: '1000' });
+  const t0 = performance.now();
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: true }, key: 't-ch2' }), env, {});
+  const elapsed = performance.now() - t0;
+  assert.equal(res.status, 200);
+  assert.ok(elapsed >= 1000, 'stream must NOT be cut by chat timeout, waited ' + Math.round(elapsed) + 'ms');
+});
+
+await t('ADM19 smoke 不污染钉住: ADMIN_KEY 会话 smoke 后不产生 c:<adminKey> pin', async () => {
+  const p = await makeProxy('ad19');
+  p.ctl.mode = 'json';
+  const env = { PROXIES: p.url, GATEWAY_API_KEYS: 'pw', API_KEY: 'ck', ADMIN_KEY: 'ak' };
+  const r = await worker.fetch(new Request('https://gw.example/admin/api/smoke', { method: 'POST', headers: { Authorization: 'Bearer ak', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'freebuff-1', prompt: 'hi', stream: false }) }), env, {});
+  assert.equal((await r.json()).ok, true);
+  // BUG: 旧代码 smoke 走完整 routeRequest, 成功会把管理会话钉到被测 proxy
+  // (ADMIN_KEY 场景产生 c:<adminKey> 垃圾 pin; 未配 ADMIN_KEY 时污染真实客户端 key 的路由)
+  const pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer ak' } }), env, {})).json();
+  assert.equal(pr.pinned_proxy, null);
+  assert.equal(pr.sticky_key, 'c:ak');
+});
+
+await t('ADM20 PIN_MODE=off 时清除覆盖 header 命名空间遗留 pin', async () => {
+  const p = await makeProxy('ad20');
+  const envH = envFor([p], { API_KEY: 't-ad20', PIN_MODE: 'header' });
+  const [n1] = proxyNames([p]);
+  // header 模式钉住
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'legacy-conv' }, key: 't-ad20' }), envH, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n1);
+  // off 模式: 清除应同时覆盖 c: 与 h: 前缀 (旧代码只删 c:, h: 遗留 pin 清不掉)
+  const envOff = envFor([p], { API_KEY: 't-ad20', PIN_MODE: 'off' });
+  await worker.fetch(new Request('https://gw.example/admin/api/pin', { method: 'POST', headers: { Authorization: 'Bearer t-ad20', 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'legacy-conv' }) }), envOff, {});
+  advance(61e3); // 避开状态新鲜窗口, 直接读 pin
+  const pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-ad20', 'X-Sticky-Id': 'legacy-conv' } }), envH, {})).json();
+  assert.equal(pr.pinned_proxy, null, 'legacy h: pin must be cleared in off mode');
+});
+
 console.log('\n== 运行时配置 (后台管理代理/参数) ==');
 
 await t('RUN1 保存代理列表 → 立即生效, 路由用新代理 + 各自的 apiKey', async () => {
@@ -1403,6 +1604,75 @@ await t('RUN4 重置 → 清除运行时配置, 恢复环境变量', async () =>
   assert.equal(cfg.config.runtime_managed, false);
   assert.equal(cfg.config.has_runtime_config, false);
   assert.equal(cfg.config.proxies.length, 1); // 回到环境变量的 1 个代理
+});
+
+await t('RUN5 部分保存不互相覆盖: 存代理 + 存参数各自保留 (读-改-写合并)', async () => {
+  const pa = await makeProxy('run5a');
+  const env = envFor([pa], { API_KEY: 't-run5' });
+  // 1. 只保存代理列表
+  let r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run5', 'Content-Type': 'application/json' }, body: JSON.stringify({ proxies: [{ name: 'r5', url: pa.url, apiKey: 'k5' }] }) }), env, {});
+  assert.equal(r.status, 200);
+  // 2. 只保存参数 (不传 proxies) —— BUG: 旧代码整体替换, 代理列表被清掉
+  r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run5', 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { pinMode: 'header' } }) }), env, {});
+  assert.equal(r.status, 200);
+  let cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-run5' } }), env, {})).json();
+  assert.equal(cfg.config.runtime_managed, true);
+  assert.equal(cfg.config.proxies.length, 1, 'proxy list must survive settings-only save');
+  assert.equal(cfg.config.proxies[0].name, 'r5');
+  assert.equal(cfg.config.pin_mode, 'header');
+  // 3. 反向: 再只保存代理 → 参数保留
+  r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run5', 'Content-Type': 'application/json' }, body: JSON.stringify({ proxies: [{ name: 'r5b', url: pa.url, apiKey: 'k5' }] }) }), env, {});
+  assert.equal(r.status, 200);
+  cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-run5' } }), env, {})).json();
+  assert.equal(cfg.config.proxies[0].name, 'r5b');
+  assert.equal(cfg.config.pin_mode, 'header', 'settings must survive proxies-only save');
+});
+
+await t('SET1 部分保存参数不再丢其它已存参数 (settings 读-改-写合并)', async () => {
+  const p = await makeProxy('set1');
+  const env = envFor([p], { API_KEY: 't-set1' });
+  // 1. 全量保存 (模拟设置页 8 字段提交)
+  let r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-set1', 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { pinMode: 'client', pinTtl: 3600, stateTtl: 60, depletedProbe: 300, downProbe: 120, probeTimeout: 3000, chatTimeout: 120000, maxAttempts: 3 } }) }), env, {});
+  assert.equal(r.status, 200);
+  // 2. 只改一个字段 (部分 POST: 未来的精简表单/API 客户端只传 pinMode)
+  r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-set1', 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { pinMode: 'off' } }) }), env, {});
+  assert.equal(r.status, 200);
+  const cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-set1' } }), env, {})).json();
+  assert.equal(cfg.config.pin_mode, 'off');
+  // BUG: 旧代码 rc.settings 整体替换 → 只传 {pinMode} 会静默丢掉 maxAttempts 等已存参数
+  assert.equal(cfg.config.max_attempts, 3, 'maxAttempts must survive a partial settings save');
+  assert.equal(cfg.config.chat_timeout, 120000, 'chatTimeout must survive a partial settings save');
+  assert.equal(cfg.config.probe_timeout, 3000, 'probeTimeout must survive a partial settings save');
+});
+
+await t('RUN6 运行时配置拒绝重复 URL (与 env 解析一致)', async () => {
+  const p = await makeProxy('run6');
+  const env = envFor([p], { API_KEY: 't-run6' });
+  const r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run6', 'Content-Type': 'application/json' }, body: JSON.stringify({ proxies: [
+    { name: 'x1', url: 'https://dup.example.com', apiKey: 'k' },
+    { name: 'x2', url: 'https://dup.example.com', apiKey: 'k' },
+  ] }) }), env, {});
+  // BUG: 旧代码运行时配置不查 URL 去重 → 同一 URL 两个 name 双倍探测
+  assert.equal(r.status, 400);
+});
+
+await t('RUN7 运行时配置脏数据降级: 非法 proxies → 回退环境变量 + runtime_error 暴露', async () => {
+  const p = await makeProxy('run7');
+  const env = envFor([p], { API_KEY: 't-run7' });
+  // 直接向 cache 塞脏运行时配置 (绕过 adminSaveConfig 校验, 模拟跨版本/手工污染)
+  await caches.default.put('https://cf-quota-gateway.invalid/runtime-config', new Response(JSON.stringify({
+    proxies: [{ name: 'bad', url: 'not-a-url', apiKey: 'k' }],
+  }), { headers: { 'Content-Type': 'application/json' } }), { ttl: 2592000 });
+  const cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-run7' } }), env, {})).json();
+  assert.equal(cfg.config.runtime_managed, false, 'proxies must fall back to env');
+  assert.equal(cfg.config.has_runtime_config, true, 'runtime config does exist in cache');
+  assert.ok(cfg.config.runtime_error && /invalid url/.test(cfg.config.runtime_error),
+    'runtime_error should describe the fallback, got: ' + JSON.stringify(cfg.config.runtime_error));
+  // 路由仍可用 (回退环境变量)
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-run7' }), env, {});
+  assert.equal(res.status, 200);
+  // 清理, 避免污染后续
+  await worker.fetch(new Request('https://gw.example/admin/api/config/reset', { method: 'POST', headers: { Authorization: 'Bearer t-run7', 'Content-Type': 'application/json' }, body: '{}' }), env, {});
 });
 
 // 收尾
