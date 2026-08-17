@@ -6,6 +6,7 @@
   "observability": {
     "enabled": true
   },
+  "keep_vars": true,
   "vars": {
     "PIN_MODE": "client",
     "PIN_TTL_SECONDS": "3600",

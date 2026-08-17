@@ -106,15 +106,15 @@ npx wrangler dev
 
 1. Dashboard → **Workers & Pages → Create → Import from repository** → 连接 GitHub，选 `fskanokano/freebuff-proxy-gateway`
 2. 点 **Deploy**（零构建步骤，无 binding 需要创建）
-3. 部署后进入 Worker → **Settings → Variables and Secrets**，添加 3 个 **Secret**（⚠️ 必须配在这里，而不是 Settings → Build 的 "Build variables"——构建变量运行时不可见）：
-   - `PROXIES`：`https://proxy-a.workers.dev`（单个或多个逗号分隔）
-   - `GATEWAY_API_KEYS`：下游共用/对应 key
-   - `API_KEY`：客户端调网关的 key
+3. 部署后进入 Worker → **Settings → Variables and Secrets**，添加 3 个变量。⚠️ **类型务必选 `Secret`**（不要选 Text/文本）——wrangler 每次部署会删除 Worker 上所有文本变量再写入配置文件里的 vars（`wrangler.jsonc` 已设 `keep_vars: true` 做双保险，但 **secrets 是唯一绝对不会被部署清除的类型**）：
+   - `PROXIES`（Secret）：`https://proxy-a.workers.dev`（单个或多个逗号分隔）
+   - `GATEWAY_API_KEYS`（Secret）：下游共用/对应 key
+   - `API_KEY`（Secret）：客户端调网关的 key
 4. **添加后必须点一次 "Deploy"（或推送一次代码触发 Git 自动部署），变量才会进入运行版本**——否则会报 `PROXIES missing: ... config_error`（此时错误响应里的 `received_env_keys` 字段会显示运行时实际收到了哪些变量，可用于排查）
 
 > 零绑定：不依赖 KV / Durable Objects / 任何 binding，免费计划直接可用。`wrangler.jsonc` 中的可选 vars 已在导入时预填默认值。
 
-> **配置了仍报 config_error？** 按顺序检查：① 变量是否配在 **Settings → Variables and Secrets**（不是 Build settings）；② 添加后是否触发了新的 Deploy；③ 变量名是否与文档完全一致（`PROXIES` 全大写）；④ 是否配在了正确的 Worker/账户下。请求任意路径，网关的错误响应会列出 `received_env_keys`，一眼看出哪些变量进了运行时。
+> **配置了仍报 config_error？** 按顺序检查：① 变量类型是否选的是 **Secret**（文本变量会被每次部署清除——secrets 不会被清除）；② 是否配在 **Settings → Variables and Secrets**（不是 Build settings）；③ 添加后是否触发了新的 Deploy；④ 变量名是否与文档完全一致（`PROXIES` 全大写）；⑤ 是否配在了正确的 Worker/账户下。请求任意路径，网关的错误响应会列出 `received_env_keys`，一眼看出哪些变量进了运行时。
 
 ## 管理后台
 
