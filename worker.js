@@ -881,10 +881,14 @@ async function handleModels(req, cfg) {
 const ROUTES_KEY = CACHE_ORIGIN + '/routes';
 const MAX_ROUTES = 200;
 const ROUTE_L1 = [];
+let routeFlushChain = Promise.resolve(); // 串行化同 isolate 落盘, 防并发覆盖丢条目
 
 function pushRoute(cfg, detail) {
   ROUTE_L1.push({ t: nowMs(), ...detail });
-  if (ROUTE_L1.length >= 10) flushRoutes(cfg).catch(() => {});
+  // 每推必落盘 (不再攒 10 条才 flush): 低流量/多 isolate 部署下, 旧逻辑里日志会一直滞留
+  // 在本 isolate 的 L1 里, 管理后台 (常常命中别的 isolate) 永远看不到。同 isolate 串行写,
+  // 跨 isolate 最后写者胜 (尽力而为, 与事件日志同一策略)。
+  routeFlushChain = routeFlushChain.then(() => flushRoutes(cfg)).catch(() => {});
 }
 
 async function flushRoutes(cfg) {
@@ -904,7 +908,8 @@ async function flushRoutes(cfg) {
 
 async function readRoutes() {
   try {
-    await flushRoutes({}); // 先把 L1 累积写入
+    await routeFlushChain;   // 等本 isolate 未完成的落盘先写完, 避免读到旧列表
+    await flushRoutes({});   // 把 L1 剩余累积写入
     const r = await caches.default.get(ROUTES_KEY);
     if (!r) return [];
     const j = await r.json();
@@ -916,15 +921,14 @@ async function readRoutes() {
 
 const EVENTS_KEY = CACHE_ORIGIN + '/events';
 const MAX_EVENTS = 200;
-const EVENT_L1 = []; // isolate 内聚合, 攒够批量 flush
+const EVENT_L1 = []; // isolate 内聚合
+let eventFlushChain = Promise.resolve(); // 串行化同 isolate 落盘
 
-// 记录一条管理/运行事件 (尽力而为: L1 聚合 + cache 环形缓冲, 跨 isolate 最后写者胜)
+// 记录一条管理/运行事件 (尽力而为: cache 环形缓冲, 跨 isolate 最后写者胜)
+// 每推必落盘: 攒批 >=10 才 flush 会让低流量时的日志滞留本 isolate, 管理后台看不到
 function pushEvent(cfg, type, detail) {
   EVENT_L1.push({ t: nowMs(), type, ...detail });
-  if (EVENT_L1.length >= 10) {
-    // 不阻塞主流程
-    flushEvents(cfg).catch(() => {});
-  }
+  eventFlushChain = eventFlushChain.then(() => flushEvents(cfg)).catch(() => {});
 }
 
 async function flushEvents(cfg) {
@@ -944,7 +948,8 @@ async function flushEvents(cfg) {
 
 async function readEvents() {
   try {
-    await flushEvents({}); // 先把 L1 累积写进去
+    await eventFlushChain;   // 等本 isolate 未完成的落盘先写完
+    await flushEvents({});   // 把 L1 剩余累积写进去
     const r = await caches.default.get(EVENTS_KEY);
     if (!r) return [];
     const j = await r.json();

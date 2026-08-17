@@ -65,6 +65,32 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
   .sidebar{display:block} .tabbar{display:none}
   .content{padding:20px 24px 40px}
 }
+/* ── 桌面端单独适配 (≥1024px): 紧凑侧边栏 + 双列卡片, 消除大面积空白; 不影响手机/平板 ── */
+@media (min-width:1024px){
+  .app{max-width:1080px}
+  .sidebar{width:190px;padding:14px 8px}
+  .side-item{padding:9px 10px;gap:9px;font-size:14px;border-radius:8px}
+  .side-item svg{width:22px;height:22px}
+  .content{padding:22px 26px 40px}
+  h2.section{font-size:24px;margin-bottom:12px}
+  .btn{width:auto;padding:10px 20px;min-height:40px}
+  .login-card .btn{width:100%}
+  /* 卡片加细描边, 告别"白板漂浮", 更精致 */
+  .card,.proxy,.stat,.pin-banner{border:0.5px solid var(--sep)}
+  .card{margin-bottom:12px}
+  /* 总览: 统计整行, 流量与健康度两卡并排 */
+  #view-overview.active{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;align-items:start}
+  #view-overview.active > h2,#view-overview.active > .stats{grid-column:1/-1}
+  #view-overview.active > .stats{margin-bottom:12px}
+  #view-overview.active > .card{margin-bottom:12px}
+  /* 代理卡片双列 */
+  .proxy-cards{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
+  .proxy-cards .proxy{margin-bottom:0}
+  /* 设置页双列: 参数/鉴权/代理/界面 两两并排 */
+  #view-settings.active{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;align-items:start}
+  #view-settings.active > h2,#view-settings.active > .sub{grid-column:1/-1}
+  #view-settings.active > .card{margin-bottom:12px}
+}
 .view{display:none} .view.active{display:block;animation:fade .18s ease}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 /* ── 卡片 ── */
@@ -344,9 +370,12 @@ function renderProxies(d){
   el.innerHTML='<h2 class="section">代理</h2>'+
     '<div class="sub">开关 = 代理启用状态 (关 = 进入维护, 不参与选路); 支持添加/编辑/删除代理</div>'+
     '<div id="pinBanner"></div>'+
-    '<div style="margin-bottom:14px"><button class="btn" id="addProxyBtn" style="min-height:40px">＋ 添加代理</button></div>';
-  if(!d.proxies.length)el.insertAdjacentHTML("beforeend",'<div class="card"><div class="empty">未配置任何代理</div></div>');
-  d.proxies.forEach(function(pr){el.insertAdjacentHTML("beforeend",proxyCard(pr))});
+    '<div style="margin-bottom:14px"><button class="btn" id="addProxyBtn" style="min-height:40px">＋ 添加代理</button></div>'+
+    '<div class="proxy-cards"></div>';
+  // 代理卡片容器: 桌面端 (≥1024px) 双列网格, 手机/平板保持单列
+  var cardsEl=el.querySelector(".proxy-cards");
+  if(!d.proxies.length)cardsEl.innerHTML='<div class="card"><div class="empty">未配置任何代理</div></div>';
+  d.proxies.forEach(function(pr){cardsEl.insertAdjacentHTML("beforeend",proxyCard(pr))});
   // 加载完整配置 (含 apiKey) 供编辑
   api("/config").then(function(cd){
     _cfgProxies=(cd.config&&cd.config.proxies||[]).slice();

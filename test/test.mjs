@@ -3,7 +3,7 @@
 // 运行: node test/test.mjs
 import http from 'node:http';
 import assert from 'node:assert/strict';
-import { pathToFileURL } from 'node:url';
+// 注: 直接用 URL 而非 pathToFileURL(pathname) —— 后者在 Windows 上会把盘符拼成 D:/D:/...
 
 // ── 运行时 shim ─────────────────────────────────────────────
 
@@ -162,7 +162,7 @@ function proxyNames(proxies) {
 
 // ── worker 加载 ─────────────────────────────────────────────
 
-const worker = (await import(pathToFileURL(new URL('../worker.js', import.meta.url).pathname).href)).default;
+const worker = (await import(new URL('../worker.js', import.meta.url).href)).default;
 
 function envFor(proxies, extra = {}) {
   return {
@@ -1315,6 +1315,31 @@ await t('ADM17 每次请求都记录路由日志 (成功/失败, overview 返回
   assert.equal(last.ok, false);
   assert.equal(last.status, 429);
   assert.equal(last.attempts, 2);
+});
+
+await t('ADM18 低流量日志不滞留: 单次请求后路由/事件日志立即可见 (不再等攒够 10 条才 flush)', async () => {
+  const p = await makeProxy('rk3');
+  const env = envFor([p], { API_KEY: 't-rk3' });
+  const [n1] = proxyNames([p]);
+  // 只发 1 条请求 (旧逻辑: ROUTE_L1 攒不满 10 条, 换个 isolate 就看 不到日志)
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-rk3' }), env, {});
+  assert.equal(res.status, 200);
+  await new Promise(resolve => setTimeout(resolve, 10)); // 让 fire-and-forget 的落盘链完成 (不阻塞主流程)
+  // 不经过任何 overview 读取 (模拟管理后台命中另一个 isolate), 直接查共享 cache:
+  // pushRoute 必须已把这条路由落盘, 而不是滞留在本 isolate 的 L1 里
+  const r = await caches.default.get('https://cf-quota-gateway.invalid/routes');
+  assert.ok(r, 'route log should be flushed to shared cache right after a single request');
+  const list = await r.json();
+  assert.ok(Array.isArray(list) && list.length >= 1, 'routes in cache: ' + JSON.stringify(list));
+  assert.equal(list[list.length - 1].name, n1, 'last route should be ' + n1 + ', got: ' + list[list.length - 1].name);
+  assert.equal(list[list.length - 1].ok, true);
+  // 事件同理: 触发一个管理操作事件, 单条也应立即可见
+  await worker.fetch(new Request('https://gw.example/admin/api/probe', { method: 'POST', headers: { Authorization: 'Bearer t-rk3', 'Content-Type': 'application/json' }, body: JSON.stringify({ name: n1 }) }), env, {});
+  await new Promise(resolve => setTimeout(resolve, 10)); // 等事件落盘
+  const er = await caches.default.get('https://cf-quota-gateway.invalid/events');
+  assert.ok(er, 'event log should be flushed to shared cache right after one admin action');
+  const ev = await er.json();
+  assert.ok(Array.isArray(ev) && ev.some(e => e.type === 'admin_action' && e.action === 'probe'), 'admin_action event visible: ' + JSON.stringify(ev));
 });
 
 console.log('\n== 运行时配置 (后台管理代理/参数) ==');
