@@ -1229,10 +1229,12 @@ async function adminPinStatus(req, cfg) {
   const sticky = stickyKeyFor(req, cfg);
   let pinned = null;
   if (sticky) pinned = await getPin(sticky, cfg);
-  // 最近路由事实: 每个代理的最后成功命中时间与计数 (来自 state.lastUsed)
+  // 最近路由事实: 每个代理的最后成功命中时间与计数 (来自 state.lastUsed)。
+  // 注意: 必须走 getState (会读跨 isolate 的 cache), 不能 l1Get 短路 —— L1 里可能是
+  // blankState (本 isolate 未处理过该代理), 短路会导致永远读不到其他 isolate 的聊天记录。
   const recent = [];
   for (const p of cfg.proxies) {
-    const st = (l1Get(p.name, p.url)) || await getState(p, cfg);
+    const st = await getState(p, cfg);
     if (st && st.lastUsed > 0) {
       recent.push({ name: p.name, lastUsed: st.lastUsed, requestsOk: st.requestsOk || 0 });
     }

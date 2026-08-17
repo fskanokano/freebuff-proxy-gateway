@@ -138,6 +138,17 @@ export function makeDeadProxy() {
   return Promise.resolve({ ctl: null, url: 'http://127.0.0.1:' + port, close: async () => {} });
 }
 
+// 与 worker 相同的 FNV-1a 哈希 (测试里构造 cache key 用)
+function hashFn(s) {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 ^= c; h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 ^= c; h2 = Math.imul(h2, 0x01000193) >>> 0;
+  }
+  return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8);
+}
+
 // 与 worker 相同的名字派生
 function proxyNames(proxies) {
   const count = new Map();
@@ -1245,6 +1256,24 @@ await t('ADM14 header 模式: /admin/api/pin 按 X-Sticky-Id 返回常驻', asyn
   // 不带 X-Sticky-Id → null
   const pr2 = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pinh' } }), env, {})).json();
   assert.equal(pr2.pinned_proxy, null);
+});
+
+await t('ADM15 recent_proxies 跨 isolate 可见 (L1 blankState 时不短路 cache)', async () => {
+  const p = await makeProxy('pk5');
+  const env = envFor([p], { API_KEY: 't-pin5' });
+  const name = proxyNames([p])[0];
+  // 1. 先触发一次 /pin → getState 在本 isolate 的 L1 里存了 blankState (lastUsed=0)
+  await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin5' } }), env, {});
+  // 2. 模拟"另一个 isolate 的聊天写入": 直接向 cache 写入带 lastUsed 的代理状态
+  const stateKey = 'https://cf-quota-gateway.invalid/state/' + name + '/' + hashFn(p.url);
+  await caches.default.put(stateKey, new Response(JSON.stringify({
+    name: name, url: p.url, status: 'ok', lastUsed: 1000, requestsOk: 3, updatedAt: 1000,
+  }), { headers: { 'Content-Type': 'application/json' } }), { ttl: 60 });
+  // 3. 再查 /pin: 即使 L1 是 blankState, 也应从 cache 读到最近路由 (不短路)
+  const pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin5' } }), env, {})).json();
+  assert.ok(Array.isArray(pr.recent_proxies) && pr.recent_proxies.some(x => x.name === name && x.lastUsed > 0),
+    'recent routing should be visible from cache even when L1 is blank, got: ' + JSON.stringify(pr.recent_proxies));
+  assert.equal(pr.recent_proxies[0].requestsOk, 3);
 });
 
 console.log('\n== 运行时配置 (后台管理代理/参数) ==');
