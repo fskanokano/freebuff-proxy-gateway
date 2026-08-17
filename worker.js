@@ -213,6 +213,8 @@ function blankState(p) {
     backoff: 60,             // 秒: 当前探测退避
     detail: '',
     updatedAt: 0,
+    maint: false,          // 维护模式标记 (双通道: 独立 key + state)
+    maintChangedAt: 0,
     // 统计 (尽力而为, 随状态持久化)
     requestsOk: 0,
     requestsFail: 0,
@@ -469,9 +471,10 @@ async function setPin(sticky, proxyName, cfg) {
 // 候选排序: 全部尝试顺序 (首个尝试尽量是钉住/最优, 后续为 failover 候选)
 async function buildCandidates(cfg, model, sticky) {
   const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, { model })));
-  // 维护模式: 排除维护中的 proxy (视作不可用)。用 index 关联, 不在状态对象上打标记
+  // 维护模式: 排除维护中的 proxy (双通道: 独立 key + state.maint 标记)。
+  // 用 index 关联, 不在状态对象上打临时标记。
   const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url)));
-  const usable = (s, i) => !maint[i];
+  const usable = (s, i) => !maint[i] && !s.maint;
   const ok = states.filter((s, i) => usable(s, i) && s.status === 'ok');
   const unknown = states.filter((s, i) => usable(s, i) && s.status === 'unknown');
   const depleted = states.filter((s, i) => usable(s, i) && s.status === 'depleted');
@@ -891,7 +894,9 @@ async function isMaintenance(name, url) {
   } catch (e) { return false; }
 }
 
-async function setMaintenance(name, url, on) {
+// 双通道写入维护状态: 独立 key (跨边缘最终一致) + 该 proxy 的 state 对象
+// (每次路由都会读 state, 同边缘内立即生效; state 的 L1 缓存让同 isolate 即刻排除)。
+async function setMaintenance(name, url, on, cfg) {
   try {
     if (on) {
       await caches.default.put(maintKey(name, url), new Response(JSON.stringify({ on: true, at: nowMs() }), {
@@ -901,6 +906,26 @@ async function setMaintenance(name, url, on) {
       await caches.default.delete(maintKey(name, url));
     }
   } catch (e) { /* 尽力而为 */ }
+  // 同步到 state 对象 (若该 proxy 状态已存在)
+  const p = cfg.proxies.find(x => x.name === name && x.url === url);
+  if (p) {
+    const st = (l1Get(p.name, p.url)) || blankState(p);
+    st.maint = on;
+    st.maintChangedAt = nowMs();
+    if (on) {
+      st.status = 'down'; // 维护中视作不可用
+      st.reason = 'maintenance';
+      st.detail = 'manual maintenance mode';
+      await putState(st, cfg);
+    } else {
+      st.status = 'unknown'; // 恢复后立即重新探测, 尽快回到选路池
+      st.reason = '';
+      st.detail = '';
+      await putState(st, cfg);
+      await doProbe(p, cfg);
+    }
+    await putState(st, cfg);
+  }
 }
 
 // ─────────────────────────── 网关自身端点 ───────────────────────────
@@ -955,11 +980,13 @@ function maskKey(k) {
 async function adminOverview(cfg) {
   const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, {})));
   const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url)));
-  const proxies = states.map((st, i) => ({
+  const proxies = states.map((st, i) => {
+    const isMaint = !!maint[i] || !!st.maint;
+    return {
     name: st.name,
     url: st.url,
-    status: maint[i] ? 'maint' : st.status,
-    maint: !!maint[i],
+    status: isMaint ? 'maint' : st.status,
+    maint: isMaint,
     reason: st.reason || '',
     detail: st.detail || '',
     score: st.score,
@@ -977,7 +1004,8 @@ async function adminOverview(cfg) {
     quota: Object.fromEntries(Object.entries(st.quota || {}).map(([m, q]) => [
       m, { limit: q.limit, recent_count: q.recentCount, reset_at: q.resetAt ? new Date(q.resetAt).toISOString() : null, period: q.period },
     ])),
-  }));
+    };
+  });
   const stats = {
     total: proxies.length,
     ok: proxies.filter(p => !p.maint && p.status === 'ok').length,
@@ -1033,7 +1061,7 @@ async function adminMaintenance(req, cfg) {
   const p = cfg.proxies.find(x => x.name === body.name);
   if (!p) return errorResponse(404, 'not_found', 'no such proxy: ' + body.name, {});
   const on = !!body.on;
-  await setMaintenance(p.name, p.url, on);
+  await setMaintenance(p.name, p.url, on, cfg);
   pushEvent(cfg, 'maintenance', { name: p.name, on });
   return new Response(JSON.stringify({ name: p.name, maintenance: on }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },

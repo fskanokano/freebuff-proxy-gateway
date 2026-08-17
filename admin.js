@@ -326,11 +326,17 @@ function renderProxies(d){
       e.preventDefault();e.stopPropagation();
       var on=!sw.classList.contains("on");
       sw.style.pointerEvents="none"; // 防连点
+      // 乐观切换 UI: 立即反馈, 不被 refresh 用旧数据弹回
+      sw.classList.toggle("on",on);
+      state.skipProxyRefreshUntil=Date.now()+4000; // 4s 内轮询不重绘代理页
       api("/maintenance",{method:"POST",body:JSON.stringify({name:name,on:on})}).then(function(){
-        sw.classList.toggle("on",on);
         toast(on?"已进入维护模式":"已恢复");
-        refresh();
-      }).catch(function(e){toast("设置失败: "+e.message)}).finally(function(){sw.style.pointerEvents=""});
+        setTimeout(function(){state.skipProxyRefreshUntil=0;refresh()},1200);
+      }).catch(function(e){
+        sw.classList.toggle("on",!on); // 失败回滚
+        state.skipProxyRefreshUntil=0;
+        toast("设置失败: "+e.message);
+      }).finally(function(){sw.style.pointerEvents=""});
     };
   });
 }
@@ -494,6 +500,8 @@ function applyTheme(){
   // 自动轮询: 更新状态灯 + 刷新当前视图 (test/settings 由交互触发, 不强制轮询)
   state.timer=setInterval(function(){
     if(!state.key||$("#login").classList.contains("show"))return;
+    // 维护开关操作后短暂暂停代理页重绘, 避免旧数据把刚切换的开关弹回去
+    if(state.view==="proxies"&&state.skipProxyRefreshUntil&&Date.now()<state.skipProxyRefreshUntil)return;
     api("/overview").then(function(d){
       updateDot(d);
       if(state.view==="overview")renderOverview(d);
