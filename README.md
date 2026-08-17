@@ -92,7 +92,31 @@ npx wrangler deploy
 npx wrangler dev
 ```
 
-`wrangler.jsonc` 已声明可选项 vars；`PROXIES` / `GATEWAY_API_KEYS` / `API_KEY` 用 `wrangler secret put` 设置（避免明文进配置）。参考 `.env.example` 或本 README 的示例。
+`wrangler.jsonc` 已声明可选项 vars；`PROXIES` / `GATEWAY_API_KEYS` / `API_KEY`（可选 `ADMIN_KEY`）用 `wrangler secret put` 设置（避免明文进配置）。参考 `.env.example` 或本 README 的示例。
+
+### 3. Cloudflare 面板一键导入（无需本地操作）
+
+1. Dashboard → **Workers & Pages → Create → Import from repository** → 连接 GitHub，选 `fskanokano/freebuff-proxy-gateway`
+2. 点 **Deploy**（零构建步骤，无 binding 需要创建）
+3. 部署后进入 Worker → **Settings → Variables and Secrets**，添加 3 个 Secret：
+   - `PROXIES`：`https://proxy-a.workers.dev,https://proxy-b.workers.dev`
+   - `GATEWAY_API_KEYS`：下游共用/对应 key
+   - `API_KEY`：客户端调网关的 key
+4. 可选手动点一次 **Deploy** 让 secret 生效（或直接请求即生效）
+
+> 零绑定：不依赖 KV / Durable Objects / 任何 binding，免费计划直接可用。`wrangler.jsonc` 中的可选 vars 已在导入时预填默认值。
+
+## 管理后台
+
+访问 `https://<gateway>.workers.dev/admin`（iOS 风格界面，手机底部 Tab / 桌面侧边栏自适应，支持深色模式）：
+
+- **总览**：代理健康度卡片、用量进度条、请求统计、状态灯
+- **代理**：每代理详情（状态/原因/分数/配额/重置时刻/连续错误）、**立即探测**、**维护模式开关**（维护中的代理不参与选路）
+- **日志**：状态变更 / failover / 探测失败 / 管理操作事件流
+- **测试**：发一条真实请求走完整路由链路（非流式/流式）
+- **设置**：生效配置查看（密钥已脱敏）、外观切换、退出登录
+
+管理 API（`/admin/api/*`）用 `ADMIN_KEY` 鉴权；未配置 `ADMIN_KEY` 时复用 `API_KEY`。页面本身公开（无敏感数据），登录密钥保存在浏览器 localStorage。本地预览 UI：`node preview.mjs` → 打开 `http://127.0.0.1:8788/admin`。
 
 ## 客户端用法
 
@@ -153,4 +177,4 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 node test/test.mjs
 ```
 
-17 个场景覆盖：按余量选路 / 钉住 / 钉住切换与重钉 / SSE 流式 / 全 depleted 429 / 恢复探测重新入池 / 客户端错不透传 / 鉴权 / header 钉住 + models 聚合 / banned / 5xx 退避 / 缺必填配置报错 / healthz 预判模型额度耗尽与冷却 / GATEWAY_API_KEYS 单 key 广播与多 key 一一对应 / X-API-Key 鉴权。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 `caches.default` 与假时钟。
+85 个场景覆盖：核心路由(选路/钉住/failover/恢复/流式) + 配置解析极端(非法URL/重复/数量不匹配/缺必填) + 鉴权极端(大小写/空白/ADMIN_KEY隔离) + 路由极端(单proxy/全down/全网络错/LRU/维护模式/pin失效) + failover极端(429时间信息三态/403矩阵/401/404/重试上限/聚合优先级/流式中断/退避封顶) + 探测极端(healthz 500/超时/畸形/单飞/恢复/未恢复) + 请求体极端(空体/非法JSON/33MB/流式兼容) + 状态缓存极端(写失败/时钟回拨/TTL边界/同名隔离) + 管理后台(overview/脱敏/probe/maintenance/pin/smoke/事件日志)。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 caches.default 与假时钟。测试还抓到并修复了 4 个真实 bug：surface 误标 down、维护标记残留、updatedAt 续期阻止重探测、异常状态保活窗口不足。

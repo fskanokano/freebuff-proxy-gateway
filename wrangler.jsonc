@@ -3,7 +3,6 @@
   "name": "freebuff-proxy-gateway",
   "main": "worker.js",
   "compatibility_date": "2026-07-01",
-  "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true
   },
@@ -16,6 +15,5 @@
     "PROBE_TIMEOUT_MS": "3000",
     "MAX_ATTEMPTS": "3",
     "LOG_LEVEL": "info"
-  },
-  "kv_namespaces": []
+  }
 }

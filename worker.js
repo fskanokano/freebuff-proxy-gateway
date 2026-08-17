@@ -21,8 +21,23 @@
  *                      配 N 个 → 按顺序一一对应 N 个下游
  *   API_KEY            网关自身鉴权 key, 客户端调用网关时用
  *                      Authorization: Bearer <API_KEY> (可逗号分隔配多个)
+ *   ADMIN_KEY          (可选) 管理后台专用 key; 未配置则复用 API_KEY
+ *
+ * 端点:
+ *   GET  /healthz              公开: 全 proxy 状态/配额 (触发过期项探测)
+ *   GET  /v1/models            聚合各 proxy 模型列表 (需 API_KEY)
+ *   POST /v1/chat/completions  转发+选路+钉住+failover (需 API_KEY)
+ *   GET  /admin                管理后台 SPA (iOS 风格, 手机/桌面自适应)
+ *   GET  /admin/api/overview   代理状态/统计/事件 (需 ADMIN_KEY 或 API_KEY)
+ *   GET  /admin/api/config     脱敏配置
+ *   POST /admin/api/probe      强制探测 (单个/全部)
+ *   POST /admin/api/maintenance 维护模式开关
+ *   POST /admin/api/pin        按客户端 key 解除钉住
+ *   POST /admin/api/smoke      发真实测试请求走完整链路
  */
 'use strict';
+
+import { ADMIN_HTML } from './admin.js';
 
 // ─────────────────────────── 配置解析 ───────────────────────────
 
@@ -116,6 +131,9 @@ function parseEnv(env) {
     cfg.clientKeys = clientKeys;
   }
 
+  // ADMIN_KEY: 管理后台专用鉴权 (可选); 未设置则管理操作复用 API_KEY
+  cfg.adminKeys = splitList(env.ADMIN_KEY).length ? splitList(env.ADMIN_KEY) : clientKeys;
+
   cfg.proxies = proxies;
   return cfg;
 }
@@ -193,15 +211,19 @@ function blankState(p) {
     backoff: 60,             // 秒: 当前探测退避
     detail: '',
     updatedAt: 0,
+    // 统计 (尽力而为, 随状态持久化)
+    requestsOk: 0,
+    requestsFail: 0,
+    statusChangedAt: 0,
   };
 }
 
-// 状态的"新鲜窗口": ok/unknown 用 stateTtl; 异常状态延长到 nextProbe (退避/重置时刻),
-// 避免跨 isolate 的提前探测破坏退避节流。
+// 状态的"新鲜窗口": ok/unknown 用 stateTtl; 异常状态延长到 nextProbe+60s 缓冲,
+// 保证 nextProbe 到期探测时旧状态仍在 (探测失败时可保持 down/depleted 而非退回 unknown)。
 function stateFreshAge(st, cfg) {
   const now = nowMs();
   if (st.status !== 'ok' && st.status !== 'unknown' && st.nextProbe > now) {
-    return Math.max(cfg.stateTtl, Math.ceil((st.nextProbe - now) / 1000)) * 1000;
+    return (Math.max(cfg.stateTtl, Math.ceil((st.nextProbe - now) / 1000)) + 60) * 1000;
   }
   return cfg.stateTtl * 1000;
 }
@@ -223,7 +245,9 @@ async function getState(p, cfg) {
 }
 
 async function putState(st, cfg) {
-  st.updatedAt = nowMs();
+  // 注意: 不在这里刷新 updatedAt —— updatedAt 表示"最近一次探测/带内状态变更"时间,
+  // 由 doProbe / recordFailure 维护。若 putState 也刷新, 每次成功请求都会续期状态
+  // 新鲜度, STATE_TTL 的重新探测将永远不会触发。
   l1Set(st.name, st.url, st);
   try {
     const resp = new Response(JSON.stringify(st), {
@@ -231,7 +255,7 @@ async function putState(st, cfg) {
     });
     let ttl = cfg.stateTtl;
     if (st.status !== 'ok' && st.status !== 'unknown' && st.nextProbe > nowMs()) {
-      ttl = Math.min(300, Math.max(cfg.stateTtl, Math.ceil((st.nextProbe - nowMs()) / 1000)));
+      ttl = Math.min(300, Math.max(cfg.stateTtl, Math.ceil((st.nextProbe - nowMs()) / 1000))) + 60;
     }
     await caches.default.put(stateKey(st.name, st.url), resp, { ttl });
   } catch (e) { log(cfg, 'debug', 'state cache put failed', { name: st.name, err: String(e) }); }
@@ -329,6 +353,7 @@ function applyHealthz(st, h) {
 
 async function doProbe(p, cfg) {
   const st = (l1Get(p.name, p.url)) || blankState(p);
+  st._prev = st.status;
   const started = nowMs();
   try {
     const ctrl = new AbortController();
@@ -347,6 +372,11 @@ async function doProbe(p, cfg) {
     st.consecutiveErrors = 0;
     st.backoff = 60;
     st.detail = st.detail + ' (probe ' + (nowMs() - started) + 'ms)';
+    if (st.status !== st._prev) {
+      pushEvent(cfg, 'status_change', { name: p.name, from: st._prev, to: st.status, reason: st.reason, detail: st.detail });
+      st.statusChangedAt = nowMs();
+    }
+    delete st._prev;
     log(cfg, 'debug', 'probe ok', { name: p.name, status: st.status, score: st.score, usagePct: st.usagePct, detail: st.detail });
   } catch (e) {
     st.lastError = nowMs();
@@ -358,9 +388,13 @@ async function doProbe(p, cfg) {
       st.reason = 'probe_failed';
       st.detail = 'healthz probe failed: ' + String(e.message || e);
     } else {
-      // 已 deprecated/down 的保持原状, 只是记录失败
+      // 已 depleted/down 的保持原状, 只是记录失败
       st.detail = 'probe failed: ' + String(e.message || e) + ' (backoff ' + st.backoff + 's)';
+      // 保底 nextProbe: doProbe 可能被 ensureFresh/adminProbe 直接调用,
+      // 确保这里持久化时异常状态的 cache TTL 与退避对齐, 不会提前过期丢状态
+      st.nextProbe = Math.max(st.nextProbe || 0, nowMs() + st.backoff * 1000);
     }
+    pushEvent(cfg, 'probe_failed', { name: p.name, status: st.status, err: String(e.message || e) });
     log(cfg, 'warn', 'probe failed', { name: p.name, status: st.status, err: String(e.message || e) });
   }
   st.updatedAt = nowMs();
@@ -433,19 +467,23 @@ async function setPin(sticky, proxyName, cfg) {
 // 候选排序: 全部尝试顺序 (首个尝试尽量是钉住/最优, 后续为 failover 候选)
 async function buildCandidates(cfg, model, sticky) {
   const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, { model })));
-  const ok = states.filter(s => s.status === 'ok');
-  const unknown = states.filter(s => s.status === 'unknown');
-  const depleted = states.filter(s => s.status === 'depleted');
-  const down = states.filter(s => s.status === 'down' || s.status === 'bad_config');
+  // 维护模式: 排除维护中的 proxy (视作不可用)。用 index 关联, 不在状态对象上打标记
+  const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url)));
+  const usable = (s, i) => !maint[i];
+  const ok = states.filter((s, i) => usable(s, i) && s.status === 'ok');
+  const unknown = states.filter((s, i) => usable(s, i) && s.status === 'unknown');
+  const depleted = states.filter((s, i) => usable(s, i) && s.status === 'depleted');
+  const down = states.filter((s, i) => usable(s, i) && (s.status === 'down' || s.status === 'bad_config'));
 
   let order = [];
   // 1) 钉住
   if (sticky) {
     const pinned = await getPin(sticky, cfg);
     if (pinned) {
-      const st = states.find(s => s.name === pinned);
-      if (st && (st.status === 'ok' || st.status === 'unknown')) order.push(st);
-      else if (st) log(cfg, 'debug', 'pin stale, dropping', { pin: pinned, status: st.status });
+      const idx = states.findIndex(s => s.name === pinned);
+      const st = idx >= 0 ? states[idx] : null;
+      if (st && usable(st, idx) && (st.status === 'ok' || st.status === 'unknown')) order.push(st);
+      else if (st) log(cfg, 'debug', 'pin stale, dropping', { pin: pinned, status: st.status, maint: maint[idx] });
     }
   }
   // 2) 按 score 升序的 ok
@@ -471,7 +509,8 @@ function extractResetMs(text, headerRetryAfter) {
   let reset = 0;
   if (text) {
     // proxy 的 RateLimitError message: "reset at 2026-08-18T07:00:00Z" / "retry after 30s"
-    const mReset = text.match(/reset at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+(?:Z|[+-][0-9:]+))/i);
+    // (RFC3339 可能带毫秒: 2026-08-18T07:00:00.123Z)
+    const mReset = text.match(/reset at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+(?:\.\d+)?(?:Z|[+-][0-9:]+))/i);
     if (mReset) reset = parseTs(mReset[1]);
     const mRetry = text.match(/retry after\s+([0-9]+)\s*s/i);
     if (mRetry && !retryAfterS) retryAfterS = parseInt(mRetry[1], 10);
@@ -502,11 +541,16 @@ async function classify(resp) {
   }
 }
 
-// 一次失败后更新 proxy 状态
+// 一次失败后更新 proxy 状态 (kind: quota | banned | bad_config | down | surface)
 async function recordFailure(st, kind, cfg, extra) {
+  // surface = 客户端请求错误 (400/404/free_mode_cli_required): 与 proxy 健康无关,
+  // 不标记任何状态, 只计数。
+  if (kind === 'surface') { st.requestsFail++; return; }
   const now = nowMs();
   st.lastError = now;
   st.consecutiveErrors++;
+  st.requestsFail++;
+  st.updatedAt = now; // 带内失败 = 新鲜的状态信号
   switch (kind) {
     case 'quota':
       st.status = 'depleted';
@@ -699,6 +743,7 @@ async function routeRequest(req, cfg, body) {
       st.lastOk = nowMs();
       st.lastUsed = nowMs();
       st.consecutiveErrors = 0;
+      st.requestsOk++;
       st.status = 'ok';
       st.reason = '';
       st.backoff = 60;
@@ -716,13 +761,20 @@ async function routeRequest(req, cfg, body) {
       return new Response(cl.resp.body, { status: cl.resp.status, headers: h });
     }
 
-    // 失败: 更新状态 + 记录
+    // 失败: 更新状态 + 记录 (surface 客户端错只透传不标记)
+    const prevStatus = st.status;
     await recordFailure(st, cl.kind, cfg, { code: cl.code, retryAfterS: cl.retryAfterS, reset: cl.reset, text: cl.text, status: cl.resp.status });
     attempts.push(cl);
     log(cfg, cl.kind === 'surface' ? 'info' : 'warn', 'attempt failed', {
       name: st.name, status: cl.resp.status, code: cl.code || '', ms: cl.ms,
     });
     if (cl.kind === 'surface') break; // 客户端错: 不再 failover
+    // 状态变化或 failover 事件 (只在尝试数 >1 或状态真的变化时记, 控制日志噪音)
+    if (st.status !== prevStatus || attempts.length > 1) {
+      pushEvent(cfg, st.status !== prevStatus ? 'status_change' : 'failover', {
+        name: st.name, from: prevStatus, to: st.status, code: cl.code || '', status: cl.resp.status,
+      });
+    }
   }
 
   req.signal.removeEventListener('abort', onClientAbort);
@@ -784,6 +836,71 @@ async function handleModels(req, cfg) {
   });
 }
 
+// ─────────────────────────── 事件日志 ───────────────────────────
+
+const EVENTS_KEY = CACHE_ORIGIN + '/events';
+const MAX_EVENTS = 200;
+const EVENT_L1 = []; // isolate 内聚合, 攒够批量 flush
+
+// 记录一条管理/运行事件 (尽力而为: L1 聚合 + cache 环形缓冲, 跨 isolate 最后写者胜)
+function pushEvent(cfg, type, detail) {
+  EVENT_L1.push({ t: nowMs(), type, ...detail });
+  if (EVENT_L1.length >= 10) {
+    // 不阻塞主流程
+    flushEvents(cfg).catch(() => {});
+  }
+}
+
+async function flushEvents(cfg) {
+  if (EVENT_L1.length === 0) return;
+  const batch = EVENT_L1.splice(0);
+  try {
+    let list = [];
+    const r = await caches.default.get(EVENTS_KEY);
+    if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
+    list = [...list, ...batch];
+    if (list.length > MAX_EVENTS) list = list.slice(list.length - MAX_EVENTS);
+    await caches.default.put(EVENTS_KEY, new Response(JSON.stringify(list), {
+      headers: { 'Content-Type': 'application/json' },
+    }), { ttl: 86400 });
+  } catch (e) { /* 尽力而为 */ }
+}
+
+async function readEvents() {
+  try {
+    await flushEvents({}); // 先把 L1 累积写进去
+    const r = await caches.default.get(EVENTS_KEY);
+    if (!r) return [];
+    const j = await r.json();
+    return Array.isArray(j) ? j.slice(-MAX_EVENTS) : [];
+  } catch (e) { return []; }
+}
+
+// ─────────────────────────── 维护模式 ───────────────────────────
+
+function maintKey(name, url) { return CACHE_ORIGIN + '/maint/' + encodeURIComponent(name) + '/' + hashKey(url); }
+
+async function isMaintenance(name, url) {
+  try {
+    const r = await caches.default.get(maintKey(name, url));
+    if (!r) return false;
+    const j = await r.json();
+    return !!(j && j.on);
+  } catch (e) { return false; }
+}
+
+async function setMaintenance(name, url, on) {
+  try {
+    if (on) {
+      await caches.default.put(maintKey(name, url), new Response(JSON.stringify({ on: true, at: nowMs() }), {
+        headers: { 'Content-Type': 'application/json' },
+      }), { ttl: 86400 });
+    } else {
+      await caches.default.delete(maintKey(name, url));
+    }
+  } catch (e) { /* 尽力而为 */ }
+}
+
 // ─────────────────────────── 网关自身端点 ───────────────────────────
 
 async function handleGatewayHealth(cfg) {
@@ -824,6 +941,165 @@ async function handleGatewayHealth(cfg) {
   });
 }
 
+// ─────────────────────────── 管理 API ───────────────────────────
+
+function maskKey(k) {
+  if (!k) return '—';
+  if (k.length <= 6) return k[0] + '***';
+  return k.slice(0, 3) + '…' + k.slice(-3);
+}
+
+// 汇总 overview: 各 proxy 状态 + 统计 + 维护状态 + 事件
+async function adminOverview(cfg) {
+  const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, {})));
+  const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url)));
+  const proxies = states.map((st, i) => ({
+    name: st.name,
+    url: st.url,
+    status: maint[i] ? 'maint' : st.status,
+    maint: !!maint[i],
+    reason: st.reason || '',
+    detail: st.detail || '',
+    score: st.score,
+    usage_pct: st.usagePct,
+    risk: st.risk || null,
+    cooldown_until: st.cooldownUntil ? new Date(st.cooldownUntil).toISOString() : null,
+    reset_at: st.resetAt ? new Date(st.resetAt).toISOString() : null,
+    retry_after_s: st.retryAfter || null,
+    next_probe: st.nextProbe ? new Date(st.nextProbe).toISOString() : null,
+    last_ok: st.lastOk ? new Date(st.lastOk).toISOString() : null,
+    last_error: st.lastError ? new Date(st.lastError).toISOString() : null,
+    consecutive_errors: st.consecutiveErrors,
+    requestsOk: st.requestsOk || 0,
+    requestsFail: st.requestsFail || 0,
+    quota: Object.fromEntries(Object.entries(st.quota || {}).map(([m, q]) => [
+      m, { limit: q.limit, recent_count: q.recentCount, reset_at: q.resetAt ? new Date(q.resetAt).toISOString() : null, period: q.period },
+    ])),
+  }));
+  const stats = {
+    total: proxies.length,
+    ok: proxies.filter(p => !p.maint && p.status === 'ok').length,
+    depleted: proxies.filter(p => !p.maint && p.status === 'depleted').length,
+    down: proxies.filter(p => !p.maint && (p.status === 'down' || p.status === 'bad_config')).length,
+    requestsOk: proxies.reduce((a, p) => a + p.requestsOk, 0),
+    requestsFail: proxies.reduce((a, p) => a + p.requestsFail, 0),
+  };
+  const events = await readEvents();
+  return new Response(JSON.stringify({ status: 'ok', stats, proxies, events, timestamp: new Date().toISOString() }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+async function adminConfig(cfg) {
+  return new Response(JSON.stringify({
+    config: {
+      proxies: cfg.proxies.map(p => p.name + ' @ ' + p.url),
+      pin_mode: cfg.pinMode,
+      pin_ttl: cfg.pinTtl,
+      state_ttl: cfg.stateTtl,
+      depleted_probe: cfg.depletedProbe,
+      down_probe: cfg.downProbe,
+      probe_timeout: cfg.probeTimeout,
+      max_attempts: cfg.maxAttempts,
+      admin_key_masked: maskKey(cfg.adminKeys[0]),
+      api_key_masked: cfg.clientKeys.map(maskKey).join(', '),
+      proxy_keys_masked: cfg.proxies.map(p => maskKey(p.apiKey)).join(', '),
+    },
+  }), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+}
+
+// 强制探测: 全部或单个 proxy (绕过 nextProbe 节流)
+async function adminProbe(req, cfg) {
+  let body = {};
+  try { body = await req.json(); } catch (e) {}
+  const targets = body.name ? cfg.proxies.filter(p => p.name === body.name) : cfg.proxies;
+  if (!targets.length) return errorResponse(404, 'not_found', 'no such proxy: ' + body.name, {});
+  const results = await Promise.all(targets.map(async p => {
+    const st = await doProbe(p, cfg);
+    pushEvent(cfg, 'admin_action', { action: 'probe', name: p.name, result: st.status });
+    return { name: p.name, status: st.status, detail: st.detail };
+  }));
+  return new Response(JSON.stringify({ results, total: results.length }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+async function adminMaintenance(req, cfg) {
+  let body = {};
+  try { body = await req.json(); } catch (e) {}
+  const p = cfg.proxies.find(x => x.name === body.name);
+  if (!p) return errorResponse(404, 'not_found', 'no such proxy: ' + body.name, {});
+  const on = !!body.on;
+  await setMaintenance(p.name, p.url, on);
+  pushEvent(cfg, 'maintenance', { name: p.name, on });
+  return new Response(JSON.stringify({ name: p.name, maintenance: on }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+// 解除钉住: 按客户端 sticky key 清除 pin
+async function adminPin(req, cfg) {
+  let body = {};
+  try { body = await req.json(); } catch (e) {}
+  const key = String(body.key || '').trim();
+  if (!key) return errorResponse(400, 'invalid_request', 'key is required', {});
+  const sticky = (cfg.pinMode === 'header' ? 'h:' : 'c:') + key;
+  try {
+    await caches.default.delete(pinKey(sticky));
+  } catch (e) {}
+  pushEvent(cfg, 'admin_action', { action: 'clear_pin', key });
+  return new Response(JSON.stringify({ cleared: true, key }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+// smoke test: 走完整路由链路发一条真实请求
+async function adminSmoke(req, cfg) {
+  let body = {};
+  try { body = await req.json(); } catch (e) {}
+  const model = String(body.model || '').trim() || 'freebuff-1';
+  const prompt = String(body.prompt || 'ping').slice(0, 500);
+  const stream = !!body.stream;
+  const chatBody = JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], stream });
+  const inner = new Request('https://gateway.invalid/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (req._gatewayKey || 'smoke') },
+    body: chatBody,
+  });
+  const started = nowMs();
+  try {
+    const resp = await routeRequest(inner, cfg, new TextEncoder().encode(chatBody));
+    let preview = '';
+    if (resp.body) {
+      const reader = resp.body.getReader();
+      try {
+        for (let i = 0; i < 6; i++) {
+          const { done, value } = await reader.read();
+          if (done || !value) break;
+          preview += new TextDecoder().decode(value, { stream: true });
+          if (preview.length > 2048) break;
+        }
+      } catch (e) { preview += '\n[read interrupted: ' + e.message + ']'; }
+      try { await reader.cancel(); } catch (e) {}
+    }
+    const result = {
+      status: resp.status,
+      proxy: resp.headers.get('x-gateway-proxy') || null,
+      attempts: Number(resp.headers.get('x-gateway-attempts')) || 1,
+      ms: nowMs() - started,
+      preview: preview.slice(0, 2048),
+    };
+    pushEvent(cfg, 'smoke', { model, status: result.status, proxy: result.proxy, ms: result.ms });
+    return new Response(JSON.stringify(result), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message, status: 502, ms: nowMs() - started }), {
+      status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    });
+  }
+}
+
 // ─────────────────────────── 鉴权 ───────────────────────────
 
 function authorized(req, cfg) {
@@ -836,6 +1112,19 @@ function authorized(req, cfg) {
   if (!key) return false;
   req._gatewayKey = key;
   return cfg.clientKeys.includes(key);
+}
+
+// 管理 API 鉴权: ADMIN_KEY 优先, 否则复用 API_KEY
+function adminAuthorized(req, cfg) {
+  if (cfg.adminKeys.length === 0) return true;
+  let key = '';
+  const auth = req.headers.get('authorization') || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (m) key = m[1].trim();
+  if (!key) key = (req.headers.get('x-api-key') || '').trim();
+  if (!key) return false;
+  req._gatewayKey = key;
+  return cfg.adminKeys.includes(key);
 }
 
 // ─────────────────────────── 入口 ───────────────────────────
@@ -859,6 +1148,28 @@ export default {
     // 网关自身端点 (公开)
     if (request.method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/')) {
       return handleGatewayHealth(cfg);
+    }
+
+    // 管理后台
+    if (url.pathname === '/admin' || url.pathname === '/admin/') {
+      return new Response(ADMIN_HTML, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders() },
+      });
+    }
+    if (url.pathname.startsWith('/admin/api/')) {
+      if (!adminAuthorized(request, cfg)) {
+        return errorResponse(401, 'invalid_api_key', 'Invalid admin key. Send it as Authorization: Bearer <ADMIN_KEY or API_KEY>.', {});
+      }
+      const apiPath = url.pathname.slice('/admin/api'.length);
+      switch (request.method + ' ' + apiPath) {
+        case 'GET /overview': return adminOverview(cfg);
+        case 'GET /config': return adminConfig(cfg);
+        case 'POST /probe': return adminProbe(request, cfg);
+        case 'POST /maintenance': return adminMaintenance(request, cfg);
+        case 'POST /pin': return adminPin(request, cfg);
+        case 'POST /smoke': return adminSmoke(request, cfg);
+        default: return errorResponse(404, 'not_found', 'unknown admin api: ' + apiPath, {});
+      }
     }
 
     // 其余全部要求网关 key
