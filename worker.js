@@ -70,7 +70,7 @@ function splitList(v) {
 }
 
 // 构建版本标识: 注入 admin HTML (便于确认加载的是最新 UI, 排查缓存问题)
-const GW_BUILD = '0b7c06f';
+const GW_BUILD = 'cb97af1';
 
 function parseEnv(env) {
   const cfg = { ...DEFAULTS };
