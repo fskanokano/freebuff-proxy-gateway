@@ -1054,7 +1054,7 @@ await t('ADM1 overview: 返回完整代理状态与统计', async () => {
   assert.ok(j.proxies.some(p => p.status === 'depleted'));
 });
 
-await t('ADM2 config: 密钥脱敏, 不泄露完整 key', async () => {
+await t('ADM2 config: 密钥脱敏, 不泄露完整 key, ADMIN_KEY 复用 API_KEY', async () => {
   const p = await makeProxy('ad2');
   const env = { PROXIES: p.url, GATEWAY_API_KEYS: 'super-secret-key-1', API_KEY: 'client-secret-abc' };
   const r = await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer client-secret-abc' } }), env, {});
@@ -1064,6 +1064,16 @@ await t('ADM2 config: 密钥脱敏, 不泄露完整 key', async () => {
   assert.ok(!text.includes('client-secret-abc'), 'full API_KEY leaked');
   assert.ok(text.includes('sup…y-1'), 'GATEWAY_API_KEYS masked form present');
   assert.ok(text.includes('cli…abc'), 'API_KEY masked form present');
+  // ADMIN_KEY 未配置 → 管理后台复用 API_KEY
+  assert.equal(j.config.admin_uses_api_key, true);
+  assert.equal(j.config.admin_key_masked, null);
+  // 配置了独立 ADMIN_KEY → 分别显示
+  const env2 = { PROXIES: p.url, GATEWAY_API_KEYS: 'k', API_KEY: 'ck', ADMIN_KEY: 'ak-secret-xyz' };
+  const r2 = await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer ak-secret-xyz' } }), env2, {});
+  const j2 = await r2.json();
+  assert.equal(j2.config.admin_uses_api_key, false);
+  assert.ok(j2.config.admin_key_masked.includes('ak-…'), 'independent ADMIN_KEY shown, got: ' + j2.config.admin_key_masked);
+  assert.ok(!JSON.stringify(j2).includes('ak-secret-xyz'), 'ADMIN_KEY not leaked');
 });
 
 await t('ADM3 probe 单个/全部', async () => {
@@ -1115,7 +1125,7 @@ await t('ADM7 pin 清除缺 key → 400', async () => {
   assert.equal(r.status, 400);
 });
 
-await t('ADM8 smoke 成功: 走完整链路返回状态/proxy/预览', async () => {
+await t('ADM8 smoke 成功: 人类可读结果 (content/ok, 非原始报文)', async () => {
   const p = await makeProxy('ad8');
   p.ctl.mode = 'json';
   const env = envFor([p], { API_KEY: 't-ad8' });
@@ -1123,19 +1133,43 @@ await t('ADM8 smoke 成功: 走完整链路返回状态/proxy/预览', async () 
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.status, 200);
+  assert.equal(j.ok, true);
   assert.ok(j.proxy);
-  assert.ok(j.preview.includes('Hello from ad8'));
+  assert.ok(j.content.includes('Hello from ad8'), 'content should extract reply text, got: ' + JSON.stringify(j.content));
+  assert.ok(!j.error, 'no error expected');
   assert.ok(j.ms >= 0);
+  assert.ok(!('preview' in j), 'raw preview field removed');
 });
 
-await t('ADM9 smoke 失败 (proxy 全 429) → 返回 429 与错误信息', async () => {
+await t('ADM9 smoke 失败 (proxy 全 429) → 人类可读错误', async () => {
   const p = await makeProxy('ad9');
   p.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 60, body: 'x' };
   const env = envFor([p], { API_KEY: 't-ad9' });
   const r = await worker.fetch(new Request('https://gw.example/admin/api/smoke', { method: 'POST', headers: { Authorization: 'Bearer t-ad9', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'freebuff-1', prompt: 'hi' }) }), env, {});
   const j = await r.json();
   assert.equal(j.status, 429);
-  assert.ok(j.preview.includes('rate_limited') || j.preview.includes('429'));
+  assert.equal(j.ok, false);
+  assert.ok(j.error && j.error.length > 0, 'human-readable error expected, got: ' + JSON.stringify(j.error));
+  assert.ok(!j.content, 'no content on failure');
+});
+
+await t('ADM9b smoke SSE 流式: content 提取 delta 文本', async () => {
+  const p = await makeProxy('ad9b');
+  p.ctl.mode = 'sse';
+  const env = envFor([p], { API_KEY: 't-ad9b' });
+  const r = await worker.fetch(new Request('https://gw.example/admin/api/smoke', { method: 'POST', headers: { Authorization: 'Bearer t-ad9b', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'freebuff-1', prompt: 'hi', stream: true }) }), env, {});
+  const j = await r.json();
+  assert.equal(j.ok, true);
+  assert.ok(j.content.includes('Hel') && j.content.includes('lo'), 'SSE delta content extracted: ' + JSON.stringify(j.content));
+});
+
+await t('ADM9c /admin/api/models 聚合模型列表', async () => {
+  const p1 = await makeProxy('ad9c1'); const p2 = await makeProxy('ad9c2');
+  const env = envFor([p1, p2], { API_KEY: 't-ad9c' });
+  const r = await worker.fetch(new Request('https://gw.example/admin/api/models', { headers: { Authorization: 'Bearer t-ad9c' } }), env, {});
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.ok(Array.isArray(j.data) && j.data.some(m => m.id === 'freebuff-1'));
 });
 
 await t('ADM10 事件日志: failover 与 status_change 被记录', async () => {

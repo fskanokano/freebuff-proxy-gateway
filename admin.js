@@ -193,7 +193,7 @@ h2.section{font-size:22px;font-weight:700;letter-spacing:-.02em;margin:2px 0 14p
 <div class="toast" id="toast"></div>
 <script>
 "use strict";
-var state={key:localStorage.getItem("gwkey")||"",view:"overview",theme:localStorage.getItem("gwtheme")||"auto",timer:null};
+var state={key:localStorage.getItem("gwkey")||"",view:localStorage.getItem("gwview")||"overview",theme:localStorage.getItem("gwtheme")||"auto",timer:null};
 var ICONS={
   overview:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>',
   proxies:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 0 1 10 10M2 12a10 10 0 0 1 10-10M12 22a10 10 0 0 1-10-10M22 12a10 10 0 0 1-10 10"/></svg>',
@@ -226,10 +226,18 @@ function api(path,opts){
 /* ── 视图切换 ── */
 function switchView(v){
   state.view=v;
+  localStorage.setItem("gwview",v); // 刷新后停留在当前界面
   document.querySelectorAll(".view").forEach(function(el){el.classList.toggle("active",el.id==="view-"+v)});
   document.querySelectorAll(".side-item").forEach(function(el){el.classList.toggle("active",el.dataset.view===v)});
   document.querySelectorAll(".tab").forEach(function(el){el.classList.toggle("active",el.dataset.view===v)});
   refresh();
+}
+// 首次加载: 让当前 view 可见 (HTML 里所有 .view 默认 display:none, 不设 active 会整页空白)
+function showInitialView(){
+  var el=document.getElementById("view-"+state.view);
+  if(el)el.classList.add("active");
+  document.querySelectorAll(".side-item").forEach(function(el){el.classList.toggle("active",el.dataset.view===state.view)});
+  document.querySelectorAll(".tab").forEach(function(el){el.classList.toggle("active",el.dataset.view===state.view)});
 }
 function buildNav(){
   var sb=$("#sidebar"),tb=$("#tabbar");sb.innerHTML="";tb.innerHTML="";
@@ -303,6 +311,28 @@ function renderProxies(d){
   el.innerHTML='<h2 class="section">代理</h2><div class="sub">点击 <b>探测</b> 立即刷新状态, 开关控制维护模式 (维护中的代理不参与选路)</div>';
   if(!d.proxies.length)el.insertAdjacentHTML("beforeend",'<div class="card"><div class="empty">未配置任何代理</div></div>');
   d.proxies.forEach(function(pr){el.insertAdjacentHTML("beforeend",proxyCard(pr))});
+  // 直接为每个卡片绑定事件 (比事件委托更可靠, 避免代理名/嵌套导致 closest 失效)
+  el.querySelectorAll(".proxy").forEach(function(card){
+    var name=card.dataset.name;
+    card.querySelector(".p-probe").onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      toast("正在探测 "+name+" …");
+      api("/probe",{method:"POST",body:JSON.stringify({name:name})}).then(function(){
+        toast("探测完成");refresh();
+      }).catch(function(e){toast("探测失败: "+e.message)});
+    };
+    var sw=card.querySelector(".switch");
+    sw.onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      var on=!sw.classList.contains("on");
+      sw.style.pointerEvents="none"; // 防连点
+      api("/maintenance",{method:"POST",body:JSON.stringify({name:name,on:on})}).then(function(){
+        sw.classList.toggle("on",on);
+        toast(on?"已进入维护模式":"已恢复");
+        refresh();
+      }).catch(function(e){toast("设置失败: "+e.message)}).finally(function(){sw.style.pointerEvents=""});
+    };
+  });
 }
 /* ── 渲染: 日志 ── */
 function renderEvents(d){
@@ -323,28 +353,64 @@ function renderEvents(d){
   el.appendChild(box);
 }
 /* ── 渲染: 测试 ── */
+var _tModels=[]; // 模型下拉缓存
 function renderTest(){
   var el=$("#view-test");
   el.innerHTML='<h2 class="section">测试请求</h2><div class="sub">发一条真实请求走完整路由链路</div>'+
   '<div class="card"><div class="card-body">'+
-  '<div class="field"><label>Model</label><input class="input" id="tModel" value="freebuff-1" placeholder="freebuff-1"></div>'+
+  '<div class="field"><label>Model</label><select class="input" id="tModel"><option value="">加载中…</option></select></div>'+
   '<div class="field"><label>Prompt</label><textarea class="input" id="tPrompt">ping</textarea></div>'+
   '<div class="seg"><button data-s="0" class="active">非流式</button><button data-s="1">流式</button></div>'+
   '<button class="btn" id="tGo">发送请求</button>'+
   '<div class="result" id="tResult" style="display:none"></div>'+
   "</div></div>";
+  // 模型下拉: 优先 /admin/api/models (聚合各代理), 回退 overview 里的模型额度, 最后允许手动输入
+  var sel=$("#tModel");
+  var opts={};
+  api("/models").then(function(j){
+    (j.data||[]).forEach(function(m){opts[m.id]=1});
+  }).catch(function(){}).then(function(){
+    return api("/overview").then(function(d){
+      (d.proxies||[]).forEach(function(p){for(var m in (p.quota||{}))opts[m]=1});
+    }).catch(function(){});
+  }).then(function(){
+    var ids=Object.keys(opts);
+    _tModels=ids;
+    if(!ids.length){sel.innerHTML='<option value="">自定义 (输入)</option>';}
+    else{
+      var html='';ids.sort().forEach(function(id){html+='<option value="'+esc(id)+'">'+esc(id)+"</option>"});
+      html+='<option value="__custom__">自定义…</option>';
+      sel.innerHTML=html;
+      sel.value=ids.indexOf("freebuff-1")>=0?"freebuff-1":ids[0];
+    }
+    // 选择"自定义…"时切换为输入框
+    sel.onchange=function(){if(sel.value==="__custom__"){toCustomModel(sel)} };
+  });
   el.querySelectorAll(".seg button").forEach(function(b){
     b.onclick=function(){el.querySelectorAll(".seg button").forEach(function(x){x.classList.remove("active")});b.classList.add("active")};
   });
   $("#tGo").onclick=function(){
     var btn=$("#tGo"),stream=el.querySelector(".seg button.active").dataset.s==="1";
+    var model=$("#tModel").value.trim();
+    if(model==="__custom__"||model==="")model="freebuff-1";
     btn.disabled=true;btn.textContent="发送中…";
     var res=$("#tResult");res.style.display="block";res.className="result";res.textContent="请求中…";
-    api("/smoke",{method:"POST",body:JSON.stringify({model:$("#tModel").value.trim()||"freebuff-1",prompt:$("#tPrompt").value,stream:stream})}).then(function(j){
-      var cls=j.status>=200&&j.status<300?"ok":"bad";
-      res.innerHTML='<span class="'+cls+'">HTTP '+j.status+"</span> · proxy: "+esc(j.proxy||"—")+" · 尝试 "+esc(j.attempts||1)+" 次 · "+esc(j.ms)+"ms<br><br>"+esc(j.preview||"");
-    }).catch(function(e){res.className="result";res.textContent="失败: "+e.message}).finally(function(){btn.disabled=false;btn.textContent="发送请求"});
+    api("/smoke",{method:"POST",body:JSON.stringify({model:model,prompt:$("#tPrompt").value,stream:stream})}).then(function(j){
+      var head='HTTP '+j.status+(j.ok?' <span class="ok">成功</span>':' <span class="bad">失败</span>')+
+        " · 路由到: "+esc(j.proxy||"—")+" · 尝试 "+esc(j.attempts||1)+" 次 · "+esc(j.ms)+"ms";
+      var bodyText="";
+      if(j.content)bodyText='<div style="margin-top:10px;font-weight:600">回复内容:</div><div style="color:var(--text2);margin-top:4px">'+esc(j.content)+"</div>";
+      if(j.error)bodyText+='<div style="margin-top:10px;font-weight:600">错误信息:</div><div style="color:var(--red);margin-top:4px">'+esc(j.error)+"</div>";
+      res.innerHTML=head+bodyText;
+    }).catch(function(e){res.className="result";res.textContent="请求失败: "+e.message}).finally(function(){btn.disabled=false;btn.textContent="发送请求"});
   };
+}
+function toCustomModel(sel){
+  var wrap=sel.parentElement;
+  var input=document.createElement("input");input.className="input";input.id="tModel";input.placeholder="输入模型名称";
+  input.value="";
+  wrap.replaceChild(input,sel);
+  input.focus();
 }
 /* ── 渲染: 设置 ── */
 function renderSettings(d){
@@ -352,7 +418,16 @@ function renderSettings(d){
   var c=d.config||{};
   var rows=[["PROXIES",c.proxies],["PIN_MODE",c.pin_mode],["PIN_TTL (s)",c.pin_ttl],["STATE_TTL (s)",c.state_ttl],
     ["DEPLETED_PROBE (s)",c.depleted_probe],["DOWN_PROBE (s)",c.down_probe],["PROBE_TIMEOUT (ms)",c.probe_timeout],
-    ["MAX_ATTEMPTS",c.max_attempts],["ADMIN_KEY",c.admin_key_masked],["API_KEY",c.api_key_masked],["GATEWAY_API_KEYS",c.proxy_keys_masked]];
+    ["MAX_ATTEMPTS",c.max_attempts]];
+  // 鉴权: ADMIN_KEY 未单独配置时, 管理后台复用 API_KEY (显示一行, 不重复)
+  if(c.admin_uses_api_key){
+    rows.push(["API_KEY / 管理后台鉴权", c.api_key_masked]);
+    rows.push(["注", "(ADMIN_KEY 未配置, 管理后台与客户端共用 API_KEY)"]);
+  }else{
+    rows.push(["API_KEY (客户端)", c.api_key_masked]);
+    rows.push(["ADMIN_KEY (管理后台)", c.admin_key_masked]);
+  }
+  rows.push(["GATEWAY_API_KEYS (下游)", c.proxy_keys_masked]);
   var html='<h2 class="section">设置</h2><div class="sub">当前生效配置 (密钥已脱敏)</div><div class="card"><div class="card-body">';
   rows.forEach(function(r){html+='<div class="cell"><div class="cell-label">'+esc(r[0])+'</div><div class="cell-value mono" style="font-size:12px;max-width:60%">'+esc(r[1]||"—")+"</div></div>"});
   html+='<div class="cell"><div class="cell-label">外观</div><div class="cell-value"><button class="btn secondary" style="width:auto;min-height:36px;padding:7px 14px;font-size:14px" id="themeBtn">切换外观</button></div></div>'+
@@ -366,15 +441,16 @@ function renderSettings(d){
   $("#logoutBtn").onclick=function(){state.key="";localStorage.removeItem("gwkey");showLogin("")};
 }
 /* ── 刷新 ── */
-function refresh(){
+function renderCurrent(){
   if(!state.key)return;
   var cur=state.view;
-  if(cur==="overview")api("/overview").then(renderOverview).catch(noop);
-  if(cur==="proxies")api("/overview").then(renderProxies).catch(noop);
-  if(cur==="events")api("/overview").then(renderEvents).catch(noop);
+  if(cur==="overview")api("/overview").then(renderOverview).catch(function(e){console.error("overview render failed",e)});
+  if(cur==="proxies")api("/overview").then(renderProxies).catch(function(e){console.error("proxies render failed",e)});
+  if(cur==="events")api("/overview").then(renderEvents).catch(function(e){console.error("events render failed",e)});
   if(cur==="test")renderTest();
-  if(cur==="settings")api("/config").then(renderSettings).catch(noop);
+  if(cur==="settings")api("/config").then(renderSettings).catch(function(e){console.error("settings render failed",e)});
 }
+function refresh(){renderCurrent()}
 function noop(){}
 function updateDot(d){
   var dot=$("#navDot");
@@ -396,12 +472,14 @@ function applyTheme(){
 }
 (function(){
   buildNav();applyTheme();
+  // 首次加载: 显示当前 view (修整页空白), 有 key 则直接渲染
+  showInitialView();
   $("#loginBtn").onclick=function(){
     var k=$("#loginKey").value.trim();
     if(!k){$("#loginErr").textContent="请输入密钥";return}
     state.key=k;
     api("/config").then(function(){
-      localStorage.setItem("gwkey",k);hideLogin();toast("登录成功");refresh();
+      localStorage.setItem("gwkey",k);hideLogin();toast("登录成功");renderCurrent();
     }).catch(function(e){state.key="";$("#loginErr").textContent=e.message});
   };
   $("#loginKey").addEventListener("keydown",function(e){if(e.key==="Enter")$("#loginBtn").click()});
@@ -411,27 +489,17 @@ function applyTheme(){
     applyTheme();localStorage.setItem("gwtheme",state.theme);
   };
   if(state.key){
-    api("/overview").then(function(d){hideLogin();updateDot(d);refresh()}).catch(function(){showLogin("")});
+    api("/overview").then(function(d){hideLogin();updateDot(d);renderCurrent()}).catch(function(){showLogin("")});
   }else showLogin("");
-  // 事件委托: 探测 / 维护开关
-  $("#content").addEventListener("click",function(e){
-    var probe=e.target.closest(".p-probe");if(probe){
-      var name=probe.closest(".proxy").dataset.name;
-      toast("正在探测 "+name+" …");
-      api("/probe",{method:"POST",body:JSON.stringify({name:name})}).then(function(){toast("探测完成");refresh()}).catch(function(e){toast(e.message)});
-      return;
-    }
-    var sw=e.target.closest(".switch");if(sw&&sw.dataset.maint){
-      var pn=sw.closest(".proxy").dataset.name,on=!sw.classList.contains("on");
-      api("/maintenance",{method:"POST",body:JSON.stringify({name:pn,on:on})}).then(function(){
-        toast(on?"已进入维护模式":"已恢复");sw.classList.toggle("on",on);refresh();
-      }).catch(function(e){toast(e.message)});
-    }
-  });
-  // 自动轮询
+  // 自动轮询: 更新状态灯 + 刷新当前视图 (test/settings 由交互触发, 不强制轮询)
   state.timer=setInterval(function(){
     if(!state.key||$("#login").classList.contains("show"))return;
-    api("/overview").then(function(d){updateDot(d);if(state.view==="overview")renderOverview(d);else if(state.view==="proxies")renderProxies(d);else if(state.view==="events")renderEvents(d)}).catch(noop);
+    api("/overview").then(function(d){
+      updateDot(d);
+      if(state.view==="overview")renderOverview(d);
+      else if(state.view==="proxies")renderProxies(d);
+      else if(state.view==="events")renderEvents(d);
+    }).catch(noop);
   },5000);
 })();
 </script>

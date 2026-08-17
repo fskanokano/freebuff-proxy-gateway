@@ -52,7 +52,8 @@ const fakeConfig = {
     proxies: ['proxy-a @ https://proxy-a.workers.dev', 'proxy-b @ https://proxy-b.vercel.app', 'proxy-c @ https://proxy-c.runsite.app'],
     pin_mode: 'client', pin_ttl: 3600, state_ttl: 60, depleted_probe: 300, down_probe: 120,
     probe_timeout: 3000, max_attempts: 3,
-    admin_key_masked: 'adm…456', api_key_masked: 'cli…789, cli…012', proxy_keys_masked: 'gw…111, gw…222, gw…333',
+    admin_uses_api_key: true, admin_key_masked: null,
+    api_key_masked: 'cli…789, cli…012', proxy_keys_masked: 'gw…111, gw…222, gw…333',
   },
 };
 
@@ -73,9 +74,22 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(fakeConfig));
     return;
   }
-  if (url.pathname === '/admin/api/probe' || url.pathname === '/admin/api/maintenance' || url.pathname === '/admin/api/smoke') {
+  if (url.pathname === '/admin/api/probe' || url.pathname === '/admin/api/maintenance') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  if (url.pathname === '/admin/api/smoke') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 200, ok: true, proxy: 'proxy-b', attempts: 1, ms: 1843, content: '你好！这是一个来自 freebuff-1 的测试回复。', error: '' }));
+    return;
+  }
+  if (url.pathname === '/admin/api/models') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ object: 'list', data: [
+      { id: 'freebuff-1', object: 'model', created: 1, owned_by: 'freebuff', available: true, status: 'available' },
+      { id: 'freebuff-1-mini', object: 'model', created: 1, owned_by: 'freebuff', available: true, status: 'available' },
+    ] }));
     return;
   }
   res.writeHead(404, { 'Content-Type': 'application/json' });

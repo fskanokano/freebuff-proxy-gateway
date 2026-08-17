@@ -132,7 +132,9 @@ function parseEnv(env) {
   }
 
   // ADMIN_KEY: 管理后台专用鉴权 (可选); 未设置则管理操作复用 API_KEY
-  cfg.adminKeys = splitList(env.ADMIN_KEY).length ? splitList(env.ADMIN_KEY) : clientKeys;
+  const adminKeyConfigured = splitList(env.ADMIN_KEY).length > 0;
+  cfg.adminKeyConfigured = adminKeyConfigured;
+  cfg.adminKeys = adminKeyConfigured ? splitList(env.ADMIN_KEY) : clientKeys;
 
   cfg.proxies = proxies;
   return cfg;
@@ -1001,8 +1003,9 @@ async function adminConfig(cfg) {
       down_probe: cfg.downProbe,
       probe_timeout: cfg.probeTimeout,
       max_attempts: cfg.maxAttempts,
-      admin_key_masked: maskKey(cfg.adminKeys[0]),
+      admin_uses_api_key: !cfg.adminKeyConfigured, // ADMIN_KEY 未配置时管理后台复用 API_KEY
       api_key_masked: cfg.clientKeys.map(maskKey).join(', '),
+      admin_key_masked: cfg.adminKeyConfigured ? maskKey(cfg.adminKeys[0]) : null,
       proxy_keys_masked: cfg.proxies.map(p => maskKey(p.apiKey)).join(', '),
     },
   }), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
@@ -1053,7 +1056,7 @@ async function adminPin(req, cfg) {
   });
 }
 
-// smoke test: 走完整路由链路发一条真实请求
+// smoke test: 走完整路由链路发一条真实请求, 返回人类可读结果
 async function adminSmoke(req, cfg) {
   let body = {};
   try { body = await req.json(); } catch (e) {}
@@ -1069,32 +1072,59 @@ async function adminSmoke(req, cfg) {
   const started = nowMs();
   try {
     const resp = await routeRequest(inner, cfg, new TextEncoder().encode(chatBody));
-    let preview = '';
+    // 读响应 (有界 256KB, smoke 是测试请求), 解析成人类可读内容
+    let raw = '';
     if (resp.body) {
       const reader = resp.body.getReader();
       try {
-        for (let i = 0; i < 6; i++) {
+        for (let i = 0; i < 4096; i++) {
           const { done, value } = await reader.read();
           if (done || !value) break;
-          preview += new TextDecoder().decode(value, { stream: true });
-          if (preview.length > 2048) break;
+          raw += new TextDecoder().decode(value, { stream: true });
+          if (raw.length > 256 * 1024) break;
         }
-      } catch (e) { preview += '\n[read interrupted: ' + e.message + ']'; }
+      } catch (e) {}
       try { await reader.cancel(); } catch (e) {}
+    }
+    const ct = resp.headers.get('content-type') || '';
+    let content = '', error = '';
+    if (ct.includes('event-stream')) {
+      // SSE: 拼接 delta content
+      for (const line of raw.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') break;
+        try {
+          const j = JSON.parse(payload);
+          const delta = j.choices && j.choices[0] && j.choices[0].delta;
+          if (delta && delta.content) content += delta.content;
+          if (j.error) { error = j.error.code || 'upstream_error'; }
+        } catch (e) {}
+      }
+    } else {
+      try {
+        const j = JSON.parse(raw);
+        if (j.error) error = (j.error.code || 'error') + ': ' + String(j.error.message || '').slice(0, 200);
+        else if (j.choices && j.choices[0] && j.choices[0].message) content = j.choices[0].message.content || '';
+      } catch (e) {
+        if (raw.trim()) error = '非 JSON 响应: ' + raw.slice(0, 160);
+      }
     }
     const result = {
       status: resp.status,
       proxy: resp.headers.get('x-gateway-proxy') || null,
       attempts: Number(resp.headers.get('x-gateway-attempts')) || 1,
       ms: nowMs() - started,
-      preview: preview.slice(0, 2048),
+      ok: resp.status >= 200 && resp.status < 300,
+      content: content.slice(0, 2000),
+      error: error,
     };
-    pushEvent(cfg, 'smoke', { model, status: result.status, proxy: result.proxy, ms: result.ms });
+    pushEvent(cfg, 'smoke', { model, status: result.status, proxy: result.proxy, ms: result.ms, ok: result.ok });
     return new Response(JSON.stringify(result), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders() },
     });
   } catch (e) {
-    return new Response(JSON.stringify({ error: e.message, status: 502, ms: nowMs() - started }), {
+    return new Response(JSON.stringify({ ok: false, status: 502, error: '网关内部错误: ' + e.message, ms: nowMs() - started }), {
       status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() },
     });
   }
@@ -1172,6 +1202,7 @@ export default {
       switch (request.method + ' ' + apiPath) {
         case 'GET /overview': return adminOverview(cfg);
         case 'GET /config': return adminConfig(cfg);
+        case 'GET /models': return handleModels(request, cfg);
         case 'POST /probe': return adminProbe(request, cfg);
         case 'POST /maintenance': return adminMaintenance(request, cfg);
         case 'POST /pin': return adminPin(request, cfg);
