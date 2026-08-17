@@ -86,7 +86,8 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/admin/api/pin') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ pin_mode: 'client', sticky_key: 'c:demo-key', pinned_proxy: 'proxy-b' }));
+    res.end(JSON.stringify({ pin_mode: 'client', sticky_key: 'c:demo-key', pinned_proxy: null,
+      recent_proxies: [{ name: 'proxy-b', lastUsed: Date.now() - 30e3, requestsOk: 12 }, { name: 'proxy-a', lastUsed: Date.now() - 120e3, requestsOk: 34 }] }));
     return;
   }
   if (url.pathname === '/admin/api/smoke') {

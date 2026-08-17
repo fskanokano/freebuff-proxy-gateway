@@ -69,8 +69,8 @@ function splitList(v) {
     .filter(Boolean);
 }
 
-// 构建版本标识: 注入 admin HTML (便于确认加载的是最新 UI, 排查缓存问题)
-const GW_BUILD = 'cb97af1';
+// 构建版本标识: 仅注入响应头 X-GW-Build 供排查部署版本 (不显示在界面)
+const GW_BUILD = 'cb98c25';
 
 function parseEnv(env) {
   const cfg = { ...DEFAULTS };
@@ -1217,18 +1217,26 @@ async function adminPin(req, cfg) {
   });
 }
 
-// 当前管理会话的钉住状态 (常驻代理): 返回当前 sticky key 命中的 proxy
+// 当前会话的钉住状态 + 全局最近路由事实 (按最近命中排序, 不依赖管理会话身份)
 async function adminPinStatus(req, cfg) {
   const sticky = stickyKeyFor(req, cfg);
-  if (!sticky) {
-    return new Response(JSON.stringify({ pin_mode: cfg.pinMode, sticky_key: null, pinned_proxy: null }), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
-    });
+  let pinned = null;
+  if (sticky) pinned = await getPin(sticky, cfg);
+  // 最近路由事实: 每个代理的最后成功命中时间与计数 (来自 state.lastUsed)
+  const recent = [];
+  for (const p of cfg.proxies) {
+    const st = (l1Get(p.name, p.url)) || await getState(p, cfg);
+    if (st && st.lastUsed > 0) {
+      recent.push({ name: p.name, lastUsed: st.lastUsed, requestsOk: st.requestsOk || 0 });
+    }
   }
-  const pinned = await getPin(sticky, cfg);
-  return new Response(JSON.stringify({ pin_mode: cfg.pinMode, sticky_key: sticky, pinned_proxy: pinned }), {
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
-  });
+  recent.sort((a, b) => b.lastUsed - a.lastUsed);
+  return new Response(JSON.stringify({
+    pin_mode: cfg.pinMode,
+    sticky_key: sticky,
+    pinned_proxy: pinned,
+    recent_proxies: recent.slice(0, 5),
+  }), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 }
 
 // smoke test: 走完整路由链路发一条真实请求, 返回人类可读结果
@@ -1366,11 +1374,10 @@ export default {
       return handleGatewayHealth(cfg);
     }
 
-    // 管理后台
+    // 管理后台 (版本仅经 X-GW-Build 响应头暴露, 不在页面显示)
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
-      const html = ADMIN_HTML.replace('<!--GWVERSION-->', GW_BUILD);
-      return new Response(html, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...corsHeaders() },
+      return new Response(ADMIN_HTML, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-GW-Build': GW_BUILD, ...corsHeaders() },
       });
     }
     if (url.pathname.startsWith('/admin/api/')) {

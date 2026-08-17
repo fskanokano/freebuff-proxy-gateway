@@ -9,7 +9,6 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#F2F2F7">
 <title>Proxy Gateway</title>
-<!--GWVERSION-->
 <style>
 :root{
   --bg:#F2F2F7; --card:#FFFFFF; --card2:#F8F8FA; --text:#000000; --text2:rgba(60,60,67,.62);
@@ -396,22 +395,29 @@ function renderProxies(d){
   });
   $("#addProxyBtn").onclick=function(){openProxyModal(null)};
 }
-// 常驻代理信息条: 当前管理会话 (sticky key) 命中的钉住代理
+// 常驻/最近路由信息条: 优先显示当前会话钉住 (常驻) 的代理, 否则显示最近实际路由到的代理
 function renderPinBanner(pd){
   var el=$("#pinBanner");if(!el)return;
-  if(!pd||!pd.pinned_proxy){
-    el.innerHTML='<div class="pin-banner"><div><div>当前会话 <b>未常驻</b> 任何代理</div>'+
-      '<div class="pin-sub">按余量实时选路 · PIN_MODE='+esc(pd?pd.pin_mode:"-")+' · 每次请求成功后自动钉住所选代理</div></div></div>';
+  var recent=pd&&pd.recent_proxies&&pd.recent_proxies.length?pd.recent_proxies[0]:null;
+  var modeTxt=pd?pd.pin_mode:"-";
+  if(pd&&pd.pinned_proxy){
+    el.innerHTML='<div class="pin-banner"><div><div>当前常驻代理: <span class="pin-name">'+esc(pd.pinned_proxy)+'</span></div>'+
+      '<div class="pin-sub">本会话请求持续路由到该代理, 直到其额度耗尽后自动切换 · 键: '+esc(pd.sticky_key||"-")+'</div></div>'+
+      '<button class="pin-clear" id="pinClearBtn">解除常驻</button></div>';
+    $("#pinClearBtn").onclick=function(){
+      if(!confirm("解除当前会话的常驻代理? 下次请求将按余量重新选路"))return;
+      var key=(pd.sticky_key||"").replace(/^[ch]:/,"");
+      api("/pin",{method:"POST",body:JSON.stringify({key:key})}).then(function(){toast("已解除常驻");refresh()}).catch(function(e){toast("解除失败: "+e.message)});
+    };
     return;
   }
-  el.innerHTML='<div class="pin-banner"><div><div>当前常驻代理: <span class="pin-name">'+esc(pd.pinned_proxy)+'</span></div>'+
-    '<div class="pin-sub">本会话请求持续路由到该代理, 直到其额度耗尽后自动切换 · 键: '+esc(pd.sticky_key||"-")+'</div></div>'+
-    '<button class="pin-clear" id="pinClearBtn">解除常驻</button></div>';
-  $("#pinClearBtn").onclick=function(){
-    if(!confirm("解除当前会话的常驻代理? 下次请求将按余量重新选路"))return;
-    var key=(pd.sticky_key||"").replace(/^[ch]:/,"");
-    api("/pin",{method:"POST",body:JSON.stringify({key:key})}).then(function(){toast("已解除常驻");refresh()}).catch(function(e){toast("解除失败: "+e.message)});
-  };
+  if(recent&&recent.lastUsed>0){
+    el.innerHTML='<div class="pin-banner"><div><div>最近路由到: <span class="pin-name">'+esc(recent.name)+'</span> <span style="font-size:12px;color:var(--text3)">('+esc(fmtAgo(recent.lastUsed))+' · 累计 '+esc(recent.requestsOk)+' 次)</span></div>'+
+      '<div class="pin-sub">当前管理会话未钉住 (用与客户端相同的 API_KEY 登录即可看到对应常驻) · PIN_MODE='+esc(modeTxt)+' · 请求成功会自动钉住所选代理</div></div></div>';
+    return;
+  }
+  el.innerHTML='<div class="pin-banner"><div><div>当前会话 <b>未常驻</b>, 暂无路由记录</div>'+
+    '<div class="pin-sub">PIN_MODE='+esc(modeTxt)+' · 客户端发起成功请求后会自动钉住所选代理</div></div></div>';
 }
 /* ── 渲染: 日志 ── */
 function renderEvents(d){

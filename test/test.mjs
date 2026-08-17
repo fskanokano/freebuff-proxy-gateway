@@ -1218,9 +1218,14 @@ await t('ADM13 /admin/api/pin 返回当前会话常驻代理 + 解除', async ()
   assert.equal(pr.pinned_proxy, n1);
   assert.equal(pr.sticky_key, 'c:t-pin');
   assert.equal(pr.pin_mode, 'client');
-  // 未钉住的客户端返回 null
+  // 最近路由事实 (即使管理会话 key 不同也能看到实际路由)
+  assert.ok(Array.isArray(pr.recent_proxies) && pr.recent_proxies.length >= 1, 'recent_proxies should list routed proxies');
+  assert.equal(pr.recent_proxies[0].name, n1, 'most recent routed proxy should be n1');
+  assert.ok(pr.recent_proxies[0].requestsOk >= 1);
+  // 未钉住的客户端: pinned null 但 recent_proxies 仍可见
   const pr2 = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin2' } }), env, {})).json();
   assert.equal(pr2.pinned_proxy, null);
+  assert.ok(pr2.recent_proxies.length >= 1, 'recent routing visible regardless of session key');
   // 解除后为 null
   await worker.fetch(new Request('https://gw.example/admin/api/pin', { method: 'POST', headers: { Authorization: 'Bearer t-pin', 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 't-pin' }) }), env, {});
   pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin' } }), env, {})).json();
