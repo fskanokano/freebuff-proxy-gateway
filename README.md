@@ -16,8 +16,8 @@
 ```
                      ┌──────────────────────────────────────┐
   OpenAI 客户端 ───► │  cf-quota-gateway (CF Workers)       │
-  Authorization:    │  · 鉴权 GATEWAY_API_KEYS              │
-  Bearer <gw-key>   │  · 选路 + 钉住 + failover             │
+  Authorization:    │  · 鉴权 API_KEY                      │
+  Bearer <API_KEY>  │  · 选路 + 钉住 + failover             │
                      │  · 状态: caches.default + L1          │
                      └──────┬──────────────┬───────────────┘
                     probe /healthz   POST /v1/chat/completions
@@ -56,9 +56,10 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `PROXIES` | ✅ | JSON 数组 `[{"name":"p1","url":"https://p1.xxx.dev","apiKey":"k1"}, ...]`。`apiKey` 必须被对应 proxy 的 `API_KEYS` 接受 |
-| `GATEWAY_API_KEYS` | ✅ | 逗号分隔的下游客户端 key（客户端用它调网关） |
-| `PIN_MODE` | | `client`（默认，按网关 key 钉住）\| `header`（按 `X-Sticky-Id`）\| `off` |
+| `PROXIES` | ✅ | 英文逗号分隔的下游 base URL，如 `https://p1.xxx.dev,https://p2.xxx.dev` |
+| `GATEWAY_API_KEYS` | ✅ | 网关调用下游 proxy 的 key，英文逗号分隔。**只配 1 个** → 所有下游共用；**配 N 个** → 按顺序一一对应 N 个下游 |
+| `API_KEY` | ✅ | **网关自身鉴权 key**，客户端调用网关时用 `Authorization: Bearer <API_KEY>`（可逗号分隔配多个）。不配则网关拒绝启动，防他人盗用 |
+| `PIN_MODE` | | `client`（默认，按客户端 key 钉住）\| `header`（按 `X-Sticky-Id`）\| `off` |
 | `PIN_TTL_SECONDS` | | 钉住有效期，默认 `3600`（每次成功请求刷新） |
 | `STATE_TTL_SECONDS` | | ok 状态 `/healthz` 刷新间隔，默认 `60`（下限 60） |
 | `DEPLETED_PROBE_SECONDS` | | depleted 探测最大退避，默认 `300` |
@@ -66,6 +67,22 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 | `PROBE_TIMEOUT_MS` | | healthz 探测超时，默认 `3000` |
 | `MAX_ATTEMPTS` | | 单请求最大尝试 proxy 数，默认 `3` |
 | `LOG_LEVEL` | | `info`（默认）\| `debug` |
+
+**最简示例**（2 个下游共用 1 个 key）：
+
+```env
+PROXIES=https://proxy-a.workers.dev,https://proxy-b.workers.dev
+GATEWAY_API_KEYS=gw-secret-1
+API_KEY=client-secret-1
+```
+
+**多下游各配各的 key**（按顺序对应）：
+
+```env
+PROXIES=https://proxy-a.workers.dev,https://proxy-b.workers.dev
+GATEWAY_API_KEYS=gw-key-for-a,gw-key-for-b
+API_KEY=client-secret-1
+```
 
 ### 2. wrangler
 
@@ -75,15 +92,15 @@ npx wrangler deploy
 npx wrangler dev
 ```
 
-`wrangler.jsonc` 已声明各 vars；`PROXIES` / `GATEWAY_API_KEYS` 用 `wrangler secret put` 设置（避免明文进配置）或填在 vars 里均可。
+`wrangler.jsonc` 已声明可选项 vars；`PROXIES` / `GATEWAY_API_KEYS` / `API_KEY` 用 `wrangler secret put` 设置（避免明文进配置）。参考 `.env.example` 或本 README 的示例。
 
 ## 客户端用法
 
-与直接用 proxy 完全相同，只是把 base URL 换成网关、key 换成 `GATEWAY_API_KEYS` 之一：
+与直接用 proxy 完全相同，只是把 base URL 换成网关、key 换成 `API_KEY`：
 
 ```bash
 curl https://<gateway>.workers.dev/v1/chat/completions \
-  -H "Authorization: Bearer <your-gateway-key>" \
+  -H "Authorization: Bearer <API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"model":"freebuff-1","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
@@ -136,4 +153,4 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 node test/test.mjs
 ```
 
-14 个场景覆盖：按余量选路 / 钉住 / 钉住切换与重钉 / SSE 流式 / 全 depleted 429 / 恢复探测重新入池 / 客户端错不透传 / 鉴权 / header 钉住 + models 聚合 / banned / 5xx 退避 / 网关 healthz / healthz 预判模型额度耗尽与冷却。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 `caches.default` 与假时钟。
+17 个场景覆盖：按余量选路 / 钉住 / 钉住切换与重钉 / SSE 流式 / 全 depleted 429 / 恢复探测重新入池 / 客户端错不透传 / 鉴权 / header 钉住 + models 聚合 / banned / 5xx 退避 / 缺必填配置报错 / healthz 预判模型额度耗尽与冷却 / GATEWAY_API_KEYS 单 key 广播与多 key 一一对应 / X-API-Key 鉴权。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 `caches.default` 与假时钟。

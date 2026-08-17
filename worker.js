@@ -1,5 +1,5 @@
 /**
- * cf-quota-gateway — 分布式额度感知路由网关 (for freebuff-proxy)
+ * freebuff-proxy-gateway — 分布式额度感知路由网关 (for freebuff-proxy)
  *
  * 拓扑:  N 个 freebuff-proxy 实例, 每实例只配 1 个 FreeBuff token。
  *        本 Worker 部署在 CF 边缘, 作为统一 OpenAI 兼容入口:
@@ -14,6 +14,13 @@
  *
  * 零依赖, WinterCG 兼容, 免费计划可用 (caches.default 作跨 isolate 状态)。
  * 状态一致性是最终一致的: 钉住偶尔过期只导致一次请求换 proxy, 自愈。
+ *
+ * 环境变量 (全部逗号分隔, 简洁直白):
+ *   PROXIES            下游 proxy base URL, 如 "https://a.xxx.dev,https://b.xxx.dev"
+ *   GATEWAY_API_KEYS   网关调用下游的 key: 配 1 个 → 所有下游共用;
+ *                      配 N 个 → 按顺序一一对应 N 个下游
+ *   API_KEY            网关自身鉴权 key, 客户端调用网关时用
+ *                      Authorization: Bearer <API_KEY> (可逗号分隔配多个)
  */
 'use strict';
 
@@ -30,6 +37,23 @@ const DEFAULTS = {
   LOG_LEVEL: 'info',             // debug | info | warn
 };
 
+// 从 URL host 第一段生成 proxy 名字 (显示用): https://proxy-a.workers.dev → "proxy-a"
+function hostPrefix(url) {
+  try {
+    const seg = (new URL(url).hostname || '').split('.')[0];
+    const n = seg.toLowerCase().replace(/[^a-z0-9-]/g, '');
+    return n || 'p';
+  } catch (e) { return 'p'; }
+}
+
+// 逗号分隔 → 去空数组
+function splitList(v) {
+  return String(v || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 function parseEnv(env) {
   const cfg = { ...DEFAULTS };
   for (const k of Object.keys(DEFAULTS)) {
@@ -44,29 +68,55 @@ function parseEnv(env) {
   cfg.maxAttempts = Math.max(1, Math.min(6, Math.floor(Number(cfg.MAX_ATTEMPTS) || 3)));
   cfg.debug = String(cfg.LOG_LEVEL).toLowerCase() === 'debug';
 
-  // PROXIES: JSON 数组 [{name,url,apiKey}]
-  if (!env.PROXIES) throw new Error('PROXIES env missing: JSON array of {name,url,apiKey}');
-  let raw;
-  try { raw = JSON.parse(env.PROXIES); } catch (e) { throw new Error('PROXIES is not valid JSON: ' + e.message); }
-  if (!Array.isArray(raw) || raw.length === 0) throw new Error('PROXIES must be a non-empty JSON array');
-  const seen = new Set();
-  cfg.proxies = raw.map((p, i) => {
-    const name = String(p.name || 'p' + (i + 1)).toLowerCase().replace(/[^a-z0-9-]/g, '');
-    if (!name) throw new Error('PROXIES entry ' + i + ': invalid name');
-    if (seen.has(name)) throw new Error('PROXIES: duplicate name "' + name + '"');
-    seen.add(name);
-    const url = String(p.url || '').replace(/\/+$/, '');
-    if (!/^https?:\/\/[^/]+/.test(url)) throw new Error('PROXIES entry "' + name + '": invalid url ' + JSON.stringify(p.url));
-    if (!p.apiKey) throw new Error('PROXIES entry "' + name + '": missing apiKey (the key this gateway uses to call that proxy)');
-    return { name, url, apiKey: String(p.apiKey), raw: p };
-  });
-  cfg.gatewayKeys = String(env.GATEWAY_API_KEYS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-  if (cfg.gatewayKeys.length === 0 && env.REQUIRE_GATEWAY_KEY !== 'false') {
-    throw new Error('GATEWAY_API_KEYS env missing: downstream clients must authenticate to this gateway');
+  // PROXIES: 逗号分隔的下游 base URL
+  const urls = splitList(env.PROXIES);
+  if (urls.length === 0) {
+    throw new Error('PROXIES missing: comma-separated proxy base URLs, e.g. "https://p1.example.com,https://p2.example.com"');
   }
+  const seenUrls = new Set();
+  const nameCount = new Map();
+  const proxies = [];
+  for (const raw of urls) {
+    const url = raw.replace(/\/+$/, '');
+    if (!/^https?:\/\/[^/]+/.test(url)) {
+      throw new Error('PROXIES: invalid URL ' + JSON.stringify(raw) + ' (expected https://host)');
+    }
+    if (seenUrls.has(url)) {
+      throw new Error('PROXIES: duplicate URL ' + url);
+    }
+    seenUrls.add(url);
+    let name = hostPrefix(url);
+    const n = (nameCount.get(name) || 0) + 1;
+    nameCount.set(name, n);
+    if (n > 1) name = name + '-' + n;
+    proxies.push({ name, url });
+  }
+
+  // GATEWAY_API_KEYS: 网关调用下游的 key。1 个 → 广播给所有下游;
+  // N 个 → 按顺序一一对应 N 个下游。
+  const proxyKeys = splitList(env.GATEWAY_API_KEYS);
+  if (proxyKeys.length === 0) {
+    throw new Error('GATEWAY_API_KEYS missing: the key(s) this gateway uses to authenticate to the downstream proxies. One key = shared by all; N keys = one per proxy in order.');
+  }
+  if (proxyKeys.length !== 1 && proxyKeys.length !== proxies.length) {
+    throw new Error('GATEWAY_API_KEYS: got ' + proxyKeys.length + ' key(s) for ' + proxies.length +
+      ' proxy(ies) — use 1 (shared) or ' + proxies.length + ' (one per proxy in order)');
+  }
+  proxies.forEach((p, i) => { p.apiKey = proxyKeys.length === 1 ? proxyKeys[0] : proxyKeys[i]; });
+
+  // API_KEY: 网关自身鉴权 (客户端调用网关)。必填, 防他人盗用。
+  const clientKeys = splitList(env.API_KEY);
+  if (clientKeys.length === 0) {
+    if (env.REQUIRE_GATEWAY_KEY === 'false') {
+      cfg.clientKeys = []; // 显式关闭鉴权 (不推荐, 网关将完全开放)
+    } else {
+      throw new Error('API_KEY missing: set the auth key clients use to call this gateway (Authorization: Bearer <API_KEY>)');
+    }
+  } else {
+    cfg.clientKeys = clientKeys;
+  }
+
+  cfg.proxies = proxies;
   return cfg;
 }
 
@@ -101,20 +151,24 @@ function parseTs(v) {
 function nowMs() { return Date.now(); }
 
 const CACHE_ORIGIN = 'https://cf-quota-gateway.invalid';
-function stateKey(name) { return CACHE_ORIGIN + '/state/' + encodeURIComponent(name); }
+// 状态 key 掺入 url 哈希: 同名不同 URL 的 proxy 状态互不串扰 (重配 url 后旧状态作废)
+function stateKey(name, url) { return CACHE_ORIGIN + '/state/' + encodeURIComponent(name) + '/' + hashKey(url); }
 function pinKey(sticky) { return CACHE_ORIGIN + '/pin/' + hashKey(sticky); }
 
-// isolate 级 L1 状态缓存 + 单飞探测
-const L1 = new Map();       // name -> state
-const INFLIGHT = new Map(); // name -> Promise<state>
+// isolate 级 L1 状态缓存 + 单飞探测。键 = name + url 哈希,
+// 同名不同 URL 的 proxy 状态互不串扰。
+const L1 = new Map();       // key -> state
+const INFLIGHT = new Map(); // key -> Promise<state>
 
-function l1Get(name) {
-  return L1.get(name) || null;
+function l1Key(name, url) { return name + '|' + hashKey(url); }
+
+function l1Get(name, url) {
+  return L1.get(l1Key(name, url)) || null;
 }
-function l1Set(name, st) {
+function l1Set(name, url, st) {
   // 注意: 不在此处盖章 updatedAt — blankState 的 updatedAt=0 表示"从未探测过",
   // ensureFresh 依赖它决定是否发起首次探测。updatedAt 只由 putState/doProbe 维护。
-  L1.set(name, st);
+  L1.set(l1Key(name, url), st);
 }
 
 // ─────────────────────────── 状态存取 ───────────────────────────
@@ -153,24 +207,24 @@ function stateFreshAge(st, cfg) {
 }
 
 async function getState(p, cfg) {
-  const mem = l1Get(p.name);
+  const mem = l1Get(p.name, p.url);
   if (mem && nowMs() - mem.updatedAt < stateFreshAge(mem, cfg)) return mem;
   try {
-    const r = await caches.default.get(stateKey(p.name));
+    const r = await caches.default.get(stateKey(p.name, p.url));
     if (r) {
       const st = await r.json();
-      l1Set(p.name, st);
+      l1Set(p.name, p.url, st);
       return st;
     }
   } catch (e) { log(cfg, 'debug', 'state cache get failed', { name: p.name, err: String(e) }); }
   const st = blankState(p);
-  l1Set(p.name, st);
+  l1Set(p.name, p.url, st);
   return st;
 }
 
 async function putState(st, cfg) {
   st.updatedAt = nowMs();
-  l1Set(st.name, st);
+  l1Set(st.name, st.url, st);
   try {
     const resp = new Response(JSON.stringify(st), {
       headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
@@ -179,13 +233,13 @@ async function putState(st, cfg) {
     if (st.status !== 'ok' && st.status !== 'unknown' && st.nextProbe > nowMs()) {
       ttl = Math.min(300, Math.max(cfg.stateTtl, Math.ceil((st.nextProbe - nowMs()) / 1000)));
     }
-    await caches.default.put(stateKey(st.name), resp, { ttl });
+    await caches.default.put(stateKey(st.name, st.url), resp, { ttl });
   } catch (e) { log(cfg, 'debug', 'state cache put failed', { name: st.name, err: String(e) }); }
 }
 
-// 单飞探测: 同一 isolate 内同名 proxy 只并发探测一次
+// 单飞探测: 同一 isolate 内同名同 URL 的 proxy 只并发探测一次
 function probeOnce(p, cfg) {
-  const key = p.name;
+  const key = l1Key(p.name, p.url);
   if (INFLIGHT.has(key)) return INFLIGHT.get(key);
   const pr = doProbe(p, cfg).finally(() => INFLIGHT.delete(key));
   INFLIGHT.set(key, pr);
@@ -274,13 +328,13 @@ function applyHealthz(st, h) {
 }
 
 async function doProbe(p, cfg) {
-  const st = (l1Get(p.name)) || blankState(p);
+  const st = (l1Get(p.name, p.url)) || blankState(p);
   const started = nowMs();
   try {
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), cfg.probeTimeout);
     const res = await fetch(p.url + '/healthz', {
-      headers: { 'User-Agent': 'cf-quota-gateway/1' },
+      headers: { 'User-Agent': 'cf-quota-gateway/1', Authorization: 'Bearer ' + p.apiKey },
       signal: ctrl.signal,
     });
     clearTimeout(to);
@@ -310,7 +364,7 @@ async function doProbe(p, cfg) {
     log(cfg, 'warn', 'probe failed', { name: p.name, status: st.status, err: String(e.message || e) });
   }
   st.updatedAt = nowMs();
-  l1Set(p.name, st);
+  l1Set(p.name, p.url, st);
   await putState(st, cfg);
   return st;
 }
@@ -509,7 +563,7 @@ function buildUpstreamHeaders(req, proxyCfg) {
     const lk = k.toLowerCase();
     if (HOP_BY_HOP.has(lk)) continue;
     if (lk === 'authorization' || lk === 'x-api-key' || lk === 'host') continue;
-    if (lk === 'x-sticky-id' || lk === 'x-gateway-key') continue;
+    if (lk === 'x-sticky-id') continue;
     h.set(k, v);
   }
   // 网关 → proxy 的鉴权: 用该 proxy 的 key (客户端 key 永不下发)
@@ -542,7 +596,7 @@ function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Sticky-Id, X-Gateway-Key',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-API-Key, X-Sticky-Id',
     'Access-Control-Expose-Headers': 'X-Gateway-Proxy, Retry-After',
   };
 }
@@ -621,11 +675,14 @@ async function routeRequest(req, cfg, body) {
   const max = Math.min(cfg.maxAttempts, order.length);
   for (let i = 0; i < max; i++) {
     const st = order[i];
-    const target = st.url + url.pathname + url.search;
+    // 转发一律用配置里的 url/apiKey (st.url 只是展示信息, 避免跨实例串状态)
+    const pc = cfg.proxies.find(p => p.name === st.name);
+    if (!pc) continue;
+    const target = pc.url + url.pathname + url.search;
     const started = nowMs();
     let resp;
     try {
-      resp = await forward(req, target, cfg.proxies.find(p => p.name === st.name), cfg, body, ac.signal);
+      resp = await forward(req, target, pc, cfg, body, ac.signal);
     } catch (e) {
       // 网络层错误
       await recordFailure(st, 'down', cfg, { status: 0, text: String(e.message || e) });
@@ -770,20 +827,15 @@ async function handleGatewayHealth(cfg) {
 // ─────────────────────────── 鉴权 ───────────────────────────
 
 function authorized(req, cfg) {
-  if (cfg.gatewayKeys.length === 0) return true;
-  let key = req.headers.get('x-gateway-key') || '';
-  if (!key) {
-    const auth = req.headers.get('authorization') || '';
-    const m = auth.match(/^Bearer\s+(.+)$/i);
-    if (m) key = m[1].trim();
-    if (!m) {
-      const xk = req.headers.get('x-api-key');
-      if (xk) key = xk.trim();
-    }
-  }
+  if (cfg.clientKeys.length === 0) return true; // REQUIRE_GATEWAY_KEY=false 显式开放
+  let key = '';
+  const auth = req.headers.get('authorization') || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (m) key = m[1].trim();
+  if (!key) key = (req.headers.get('x-api-key') || '').trim();
   if (!key) return false;
   req._gatewayKey = key;
-  return cfg.gatewayKeys.includes(key);
+  return cfg.clientKeys.includes(key);
 }
 
 // ─────────────────────────── 入口 ───────────────────────────
@@ -811,7 +863,7 @@ export default {
 
     // 其余全部要求网关 key
     if (!authorized(request, cfg)) {
-      return errorResponse(401, 'invalid_api_key', 'Invalid gateway API key. Send it as Authorization: Bearer <key> or X-Gateway-Key.', {});
+      return errorResponse(401, 'invalid_api_key', 'Invalid gateway API key. Send it as Authorization: Bearer <API_KEY> or X-API-Key.', {});
     }
 
     // 请求体缓冲 (为 failover 重放; 限制 32MB, 与 proxy 一致)
