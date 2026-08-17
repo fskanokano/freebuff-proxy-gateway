@@ -960,22 +960,29 @@ async function clearRuntimeConfig() {
 }
 
 // 环境变量为基础配置, 叠加运行时覆盖。返回新的 cfg。
+// 重要: 运行时配置校验失败时降级忽略 (继续用环境变量), 绝不因脏数据让 worker 不可用。
 async function applyRuntimeConfig(cfg) {
   const rc = await getRuntimeConfig();
   if (!rc) return cfg;
   cfg._runtime = rc;
   if (Array.isArray(rc.proxies) && rc.proxies.length > 0) {
-    const seen = new Set();
-    cfg.proxies = rc.proxies.map((p, i) => {
-      const url = String(p.url || '').replace(/\/+$/, '');
-      if (!/^https?:\/\/[^/]+/.test(url)) throw new Error('runtime proxy #' + (i + 1) + ': invalid url');
-      if (!p.apiKey) throw new Error('runtime proxy #' + (i + 1) + ': missing apiKey');
-      const name = String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1);
-      if (seen.has(name)) throw new Error('runtime config: duplicate proxy name ' + name);
-      seen.add(name);
-      return { name, url, apiKey: String(p.apiKey) };
-    });
-    cfg.runtimeProxies = true;
+    try {
+      const seen = new Set();
+      cfg.proxies = rc.proxies.map((p, i) => {
+        const url = String(p.url || '').replace(/\/+$/, '');
+        if (!/^https?:\/\/[^/]+/.test(url)) throw new Error('proxy #' + (i + 1) + ': invalid url');
+        if (!p.apiKey) throw new Error('proxy #' + (i + 1) + ': missing apiKey');
+        const name = String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1);
+        if (seen.has(name)) throw new Error('duplicate proxy name ' + name);
+        seen.add(name);
+        return { name, url, apiKey: String(p.apiKey) };
+      });
+      cfg.runtimeProxies = true;
+    } catch (e) {
+      // 降级: 忽略坏 proxies, 继续用环境变量; 记录错误供后台展示
+      cfg._runtimeError = String(e.message);
+      log(cfg, 'warn', 'runtime config proxies invalid, falling back to env', { err: String(e.message) });
+    }
   }
   const s = rc.settings;
   if (s && typeof s === 'object') {
@@ -1351,15 +1358,27 @@ export default {
       cfg = await applyRuntimeConfig(cfg); // 运行时配置覆盖环境变量 (用户后台改动优先)
     }
     catch (e) {
-      // 诊断辅助: 回显"当前运行时实际收到的环境变量名" (只列名不列值, 不含系统注入的), 
-      // 方便定位"配置了但没生效"的问题 (常见于把变量配到了 Build settings 而非
-      // Settings → Variables & Secrets, 或添加后未触发重新部署)。
+      // 诊断辅助: 回显"当前运行时实际收到的环境变量名" (只列名不列值, 不含系统注入的)
       const relevant = Object.keys(env).filter(k => /^(PROXIES|GATEWAY_API_KEYS|API_KEY|ADMIN_KEY|PIN_MODE|STATE_TTL|DEPLETED_PROBE|DOWN_PROBE|PROBE_TIMEOUT|MAX_ATTEMPTS|LOG_LEVEL|REQUIRE_GATEWAY_KEY)/.test(k)).sort();
-      return new Response(JSON.stringify({
+      const errBody = {
         error: { message: 'gateway config error: ' + e.message, code: 'config_error' },
         received_env_keys: relevant,
         hint: 'If you set these in the Cloudflare dashboard: runtime variables must go under Settings → Variables & Secrets (NOT Settings → Build → build variables), and you must trigger a new deploy after adding them.',
-      }), {
+      };
+      // 死锁防护: 配置异常时管理页面与"清除运行时配置"仍必须可用,
+      // 否则用户无法进入后台修复 (此前坏运行时配置会让 /admin 也 500 → 页面空白)。
+      if (url.pathname === '/admin' || url.pathname === '/admin/') {
+        return new Response(ADMIN_HTML, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...corsHeaders() },
+        });
+      }
+      if (url.pathname === '/admin/api/config/reset' && request.method === 'POST') {
+        try { await clearRuntimeConfig(); } catch (e2) {}
+        return new Response(JSON.stringify({ reset: true, note: '已清除运行时配置, 请重新加载页面' }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+        });
+      }
+      return new Response(JSON.stringify(errBody), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       });
     }
