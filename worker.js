@@ -83,10 +83,10 @@ function parseEnv(env) {
   cfg.maxAttempts = Math.max(1, Math.min(6, Math.floor(Number(cfg.MAX_ATTEMPTS) || 3)));
   cfg.debug = String(cfg.LOG_LEVEL).toLowerCase() === 'debug';
 
-  // PROXIES: 逗号分隔的下游 base URL
+  // PROXIES: 逗号分隔的下游 base URL (至少 1 个, 单 proxy 也完全支持)
   const urls = splitList(env.PROXIES);
   if (urls.length === 0) {
-    throw new Error('PROXIES missing: comma-separated proxy base URLs, e.g. "https://p1.example.com,https://p2.example.com"');
+    throw new Error('PROXIES missing: set at least one downstream proxy URL, e.g. "https://p1.example.com" (single proxy works fine). For multiple proxies, separate with commas: "https://p1.example.com,https://p2.example.com"');
   }
   const seenUrls = new Set();
   const nameCount = new Map();
@@ -94,7 +94,7 @@ function parseEnv(env) {
   for (const raw of urls) {
     const url = raw.replace(/\/+$/, '');
     if (!/^https?:\/\/[^/]+/.test(url)) {
-      throw new Error('PROXIES: invalid URL ' + JSON.stringify(raw) + ' (expected https://host)');
+      throw new Error('PROXIES: invalid URL ' + JSON.stringify(raw) + ' — expected a plain URL like https://p1.example.com (no quotes/brackets; separate multiple URLs with commas)');
     }
     if (seenUrls.has(url)) {
       throw new Error('PROXIES: duplicate URL ' + url);
@@ -107,11 +107,11 @@ function parseEnv(env) {
     proxies.push({ name, url });
   }
 
-  // GATEWAY_API_KEYS: 网关调用下游的 key。1 个 → 广播给所有下游;
+  // GATEWAY_API_KEYS: 网关调用下游的 key。1 个 → 所有下游共用 (最常见, 单 proxy 时必填 1 个);
   // N 个 → 按顺序一一对应 N 个下游。
   const proxyKeys = splitList(env.GATEWAY_API_KEYS);
   if (proxyKeys.length === 0) {
-    throw new Error('GATEWAY_API_KEYS missing: the key(s) this gateway uses to authenticate to the downstream proxies. One key = shared by all; N keys = one per proxy in order.');
+    throw new Error('GATEWAY_API_KEYS missing: the key this gateway sends to the downstream proxy(ies), e.g. "https://p1.example.com" → GATEWAY_API_KEYS=p1-key. One key = shared by all proxies; N keys = one per proxy in order.');
   }
   if (proxyKeys.length !== 1 && proxyKeys.length !== proxies.length) {
     throw new Error('GATEWAY_API_KEYS: got ' + proxyKeys.length + ' key(s) for ' + proxies.length +
@@ -125,7 +125,7 @@ function parseEnv(env) {
     if (env.REQUIRE_GATEWAY_KEY === 'false') {
       cfg.clientKeys = []; // 显式关闭鉴权 (不推荐, 网关将完全开放)
     } else {
-      throw new Error('API_KEY missing: set the auth key clients use to call this gateway (Authorization: Bearer <API_KEY>)');
+      throw new Error('API_KEY missing: set the auth key clients use to call this gateway, e.g. API_KEY=my-client-key (sent as Authorization: Bearer <API_KEY>)');
     }
   } else {
     cfg.clientKeys = clientKeys;
@@ -1135,7 +1135,15 @@ export default {
     let cfg;
     try { cfg = parseEnv(env); }
     catch (e) {
-      return new Response(JSON.stringify({ error: { message: 'gateway config error: ' + e.message, code: 'config_error' } }), {
+      // 诊断辅助: 回显"当前运行时实际收到的环境变量名" (只列名不列值, 不含系统注入的), 
+      // 方便定位"配置了但没生效"的问题 (常见于把变量配到了 Build settings 而非
+      // Settings → Variables & Secrets, 或添加后未触发重新部署)。
+      const relevant = Object.keys(env).filter(k => /^(PROXIES|GATEWAY_API_KEYS|API_KEY|ADMIN_KEY|PIN_MODE|STATE_TTL|DEPLETED_PROBE|DOWN_PROBE|PROBE_TIMEOUT|MAX_ATTEMPTS|LOG_LEVEL|REQUIRE_GATEWAY_KEY)/.test(k)).sort();
+      return new Response(JSON.stringify({
+        error: { message: 'gateway config error: ' + e.message, code: 'config_error' },
+        received_env_keys: relevant,
+        hint: 'If you set these in the Cloudflare dashboard: runtime variables must go under Settings → Variables & Secrets (NOT Settings → Build → build variables), and you must trigger a new deploy after adding them.',
+      }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       });
     }

@@ -409,19 +409,29 @@ await t('S17 X-API-Key 头鉴权 + API_KEY 多值', async () => {
 
 console.log('\n== 配置解析极端 ==');
 
-await t('CFG1 PROXIES 缺失/空 → 500', async () => {
+await t('CFG1 PROXIES 缺失/空 → 500 + 诊断字段', async () => {
+  // 场景 A: 完全没配 PROXIES → 诊断列表不含它
   let r = await worker.fetch(new Request('https://gw.example/healthz'), { GATEWAY_API_KEYS: 'k', API_KEY: 'k' }, {});
   assert.equal(r.status, 500);
+  let j = await r.json();
+  assert.equal(j.error.code, 'config_error');
+  assert.ok(Array.isArray(j.received_env_keys));
+  assert.ok(j.received_env_keys.includes('GATEWAY_API_KEYS'));
+  assert.ok(!j.received_env_keys.includes('PROXIES'), '未配置时不应出现在列表');
+  // 场景 B: 配了但值为空 → 诊断列表含 PROXIES (说明变量到了 runtime 但值为空)
   r = await worker.fetch(new Request('https://gw.example/healthz'), { PROXIES: '', GATEWAY_API_KEYS: 'k', API_KEY: 'k' }, {});
   assert.equal(r.status, 500);
-  const j = await r.json();
-  assert.equal(j.error.code, 'config_error');
+  j = await r.json();
+  assert.ok(j.received_env_keys.includes('PROXIES'), '值为空时 PROXIES 应出现在列表');
+  assert.ok(!JSON.stringify(j).includes('"k"'), '不应泄露变量值');
 });
 
 await t('CFG2 PROXIES 非法 URL → 500 (缺协议/坏 host)', async () => {
-  for (const bad of ['not-a-url', 'ftp://x.com', 'http://', 'https://']) {
+  for (const bad of ['not-a-url', 'ftp://x.com', 'http://', 'https://', '["https://x.com"]']) {
     const r = await worker.fetch(new Request('https://gw.example/healthz'), { PROXIES: bad, GATEWAY_API_KEYS: 'k', API_KEY: 'k' }, {});
     assert.equal(r.status, 500, 'should reject: ' + JSON.stringify(bad));
+    const j = await r.json();
+    assert.ok(j.error.message.includes('invalid URL'), 'message should explain format for: ' + JSON.stringify(bad));
   }
 });
 

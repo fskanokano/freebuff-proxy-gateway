@@ -56,7 +56,7 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `PROXIES` | ✅ | 英文逗号分隔的下游 base URL，如 `https://p1.xxx.dev,https://p2.xxx.dev` |
+| `PROXIES` | ✅ | 下游 proxy base URL，**至少 1 个**。单个：`https://p1.xxx.dev`；多个用英文逗号分隔：`https://p1.xxx.dev,https://p2.xxx.dev` |
 | `GATEWAY_API_KEYS` | ✅ | 网关调用下游 proxy 的 key，英文逗号分隔。**只配 1 个** → 所有下游共用；**配 N 个** → 按顺序一一对应 N 个下游 |
 | `API_KEY` | ✅ | **网关自身鉴权 key**，客户端调用网关时用 `Authorization: Bearer <API_KEY>`（可逗号分隔配多个）。不配则网关拒绝启动，防他人盗用 |
 | `PIN_MODE` | | `client`（默认，按客户端 key 钉住）\| `header`（按 `X-Sticky-Id`）\| `off` |
@@ -68,7 +68,15 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 | `MAX_ATTEMPTS` | | 单请求最大尝试 proxy 数，默认 `3` |
 | `LOG_LEVEL` | | `info`（默认）\| `debug` |
 
-**最简示例**（2 个下游共用 1 个 key）：
+**最简示例**（单 proxy，最常见）：
+
+```env
+PROXIES=https://proxy-a.workers.dev
+GATEWAY_API_KEYS=gw-secret-1
+API_KEY=client-secret-1
+```
+
+**多 proxy 共用 1 个 key**：
 
 ```env
 PROXIES=https://proxy-a.workers.dev,https://proxy-b.workers.dev
@@ -98,13 +106,15 @@ npx wrangler dev
 
 1. Dashboard → **Workers & Pages → Create → Import from repository** → 连接 GitHub，选 `fskanokano/freebuff-proxy-gateway`
 2. 点 **Deploy**（零构建步骤，无 binding 需要创建）
-3. 部署后进入 Worker → **Settings → Variables and Secrets**，添加 3 个 Secret：
-   - `PROXIES`：`https://proxy-a.workers.dev,https://proxy-b.workers.dev`
+3. 部署后进入 Worker → **Settings → Variables and Secrets**，添加 3 个 **Secret**（⚠️ 必须配在这里，而不是 Settings → Build 的 "Build variables"——构建变量运行时不可见）：
+   - `PROXIES`：`https://proxy-a.workers.dev`（单个或多个逗号分隔）
    - `GATEWAY_API_KEYS`：下游共用/对应 key
    - `API_KEY`：客户端调网关的 key
-4. 可选手动点一次 **Deploy** 让 secret 生效（或直接请求即生效）
+4. **添加后必须点一次 "Deploy"（或推送一次代码触发 Git 自动部署），变量才会进入运行版本**——否则会报 `PROXIES missing: ... config_error`（此时错误响应里的 `received_env_keys` 字段会显示运行时实际收到了哪些变量，可用于排查）
 
 > 零绑定：不依赖 KV / Durable Objects / 任何 binding，免费计划直接可用。`wrangler.jsonc` 中的可选 vars 已在导入时预填默认值。
+
+> **配置了仍报 config_error？** 按顺序检查：① 变量是否配在 **Settings → Variables and Secrets**（不是 Build settings）；② 添加后是否触发了新的 Deploy；③ 变量名是否与文档完全一致（`PROXIES` 全大写）；④ 是否配在了正确的 Worker/账户下。请求任意路径，网关的错误响应会列出 `received_env_keys`，一眼看出哪些变量进了运行时。
 
 ## 管理后台
 
