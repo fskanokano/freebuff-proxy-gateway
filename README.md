@@ -100,7 +100,7 @@ npx wrangler deploy
 npx wrangler dev
 ```
 
-`wrangler.jsonc` 已声明可选项 vars；`PROXIES` / `GATEWAY_API_KEYS` / `API_KEY`（可选 `ADMIN_KEY`）用 `wrangler secret put` 设置（避免明文进配置）。参考 `.env.example` 或本 README 的示例。
+`wrangler.jsonc` 不再注入任何 vars（可选参数的默认值内置于代码，`keep_vars: true` 保证部署不删除你在 dashboard 手动添加的变量）；`PROXIES` / `GATEWAY_API_KEYS` / `API_KEY`（可选 `ADMIN_KEY`）用 `wrangler secret put` 或 Dashboard **Variables & Secrets** 设置。参考 `.env.example` 或本 README 的示例。
 
 ### 3. Cloudflare 面板一键导入（无需本地操作）
 
@@ -121,10 +121,12 @@ npx wrangler dev
 访问 `https://<gateway>.workers.dev/admin`（iOS 风格界面，手机底部 Tab / 桌面侧边栏自适应，支持深色模式）：
 
 - **总览**：代理健康度卡片、用量进度条、请求统计、状态灯
-- **代理**：每代理详情（状态/原因/分数/配额/重置时刻/连续错误）、**立即探测**、**维护模式开关**（维护中的代理不参与选路）
+- **代理**：每代理详情（状态/原因/分数/配额/重置时刻/连续错误）、**立即探测**、**启用开关**（关 = 进入维护，不参与选路）、**添加/编辑/删除代理**（保存后立即生效，跨边缘传播延迟几秒）
 - **日志**：状态变更 / failover / 探测失败 / 管理操作事件流
-- **测试**：发一条真实请求走完整路由链路（非流式/流式）
-- **设置**：生效配置查看（密钥已脱敏）、外观切换、退出登录
+- **测试**：发一条真实请求走完整路由链路（模型下拉自动聚合各代理），结果人类可读
+- **设置**：**路由参数可编辑并保存**（PIN_MODE / 各 TTL / 探测超时 / 尝试次数）、鉴权脱敏展示、当前代理列表、**恢复环境变量**（清除后台运行时配置）、外观切换
+
+**运行时配置**：后台的代理增删改与参数修改会保存为"运行时配置"（优先级高于环境变量，用户改动为准），部署/重启后仍生效；点"恢复环境变量"即清除并回到环境变量配置。默认值内置于代码（不再通过 wrangler vars 注入），可用 Variables & Secrets 覆盖。
 
 管理 API（`/admin/api/*`）用 `ADMIN_KEY` 鉴权；未配置 `ADMIN_KEY` 时复用 `API_KEY`。页面本身公开（无敏感数据），登录密钥保存在浏览器 localStorage。本地预览 UI：`node preview.mjs` → 打开 `http://127.0.0.1:8788/admin`。
 

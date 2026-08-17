@@ -1054,16 +1054,19 @@ await t('ADM1 overview: 返回完整代理状态与统计', async () => {
   assert.ok(j.proxies.some(p => p.status === 'depleted'));
 });
 
-await t('ADM2 config: 密钥脱敏, 不泄露完整 key, ADMIN_KEY 复用 API_KEY', async () => {
+await t('ADM2 config: 掩码字段不泄露完整 key; proxies.apiKey 管理可见供编辑', async () => {
   const p = await makeProxy('ad2');
   const env = { PROXIES: p.url, GATEWAY_API_KEYS: 'super-secret-key-1', API_KEY: 'client-secret-abc' };
   const r = await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer client-secret-abc' } }), env, {});
   const j = await r.json();
-  const text = JSON.stringify(j);
-  assert.ok(!text.includes('super-secret-key-1'), 'full GATEWAY_API_KEYS leaked');
-  assert.ok(!text.includes('client-secret-abc'), 'full API_KEY leaked');
-  assert.ok(text.includes('sup…y-1'), 'GATEWAY_API_KEYS masked form present');
-  assert.ok(text.includes('cli…abc'), 'API_KEY masked form present');
+  // proxies[].apiKey 是完整值: 管理后台编辑需要 (仅授权用户可见)
+  assert.equal(j.config.proxies[0].apiKey, 'super-secret-key-1');
+  // 掩码展示字段不泄露完整 key
+  const maskedText = JSON.stringify(j.config.proxy_keys_masked) + JSON.stringify(j.config.api_key_masked) + JSON.stringify(j.config.admin_key_masked);
+  assert.ok(!maskedText.includes('super-secret-key-1'), 'full GATEWAY_API_KEYS in masked fields');
+  assert.ok(!maskedText.includes('client-secret-abc'), 'full API_KEY in masked fields');
+  assert.ok(j.config.proxy_keys_masked.includes('sup…y-1'), 'GATEWAY_API_KEYS masked form present');
+  assert.ok(j.config.api_key_masked.includes('cli…abc'), 'API_KEY masked form present');
   // ADMIN_KEY 未配置 → 管理后台复用 API_KEY
   assert.equal(j.config.admin_uses_api_key, true);
   assert.equal(j.config.admin_key_masked, null);
@@ -1073,7 +1076,7 @@ await t('ADM2 config: 密钥脱敏, 不泄露完整 key, ADMIN_KEY 复用 API_KE
   const j2 = await r2.json();
   assert.equal(j2.config.admin_uses_api_key, false);
   assert.ok(j2.config.admin_key_masked.includes('ak-…'), 'independent ADMIN_KEY shown, got: ' + j2.config.admin_key_masked);
-  assert.ok(!JSON.stringify(j2).includes('ak-secret-xyz'), 'ADMIN_KEY not leaked');
+  assert.ok(!JSON.stringify(j2.config.admin_key_masked).includes('ak-secret-xyz'), 'ADMIN_KEY not leaked in masked field');
 });
 
 await t('ADM3 probe 单个/全部', async () => {
@@ -1199,6 +1202,107 @@ await t('ADM12 smoke 用 ADMIN_KEY 也允许 (adminAuthorized)', async () => {
   const env = { PROXIES: p.url, GATEWAY_API_KEYS: 'pw', API_KEY: 'ck', ADMIN_KEY: 'ak' };
   const r = await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer ak' } }), env, {});
   assert.equal(r.status, 200);
+});
+
+await t('ADM13 /admin/api/pin 返回当前会话常驻代理 + 解除', async () => {
+  const p1 = await makeProxy('pk1'); const p2 = await makeProxy('pk2');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.usagePct = 5; p2.ctl.usagePct = 50;
+  const env = envFor([p1, p2], { API_KEY: 't-pin,t-pin2' });
+  // 先发请求钉住 n1
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-pin' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n1);
+  // 常驻状态
+  let pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin' } }), env, {})).json();
+  assert.equal(pr.pinned_proxy, n1);
+  assert.equal(pr.sticky_key, 'c:t-pin');
+  assert.equal(pr.pin_mode, 'client');
+  // 未钉住的客户端返回 null
+  const pr2 = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin2' } }), env, {})).json();
+  assert.equal(pr2.pinned_proxy, null);
+  // 解除后为 null
+  await worker.fetch(new Request('https://gw.example/admin/api/pin', { method: 'POST', headers: { Authorization: 'Bearer t-pin', 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 't-pin' }) }), env, {});
+  pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pin' } }), env, {})).json();
+  assert.equal(pr.pinned_proxy, null);
+});
+
+await t('ADM14 header 模式: /admin/api/pin 按 X-Sticky-Id 返回常驻', async () => {
+  const p1 = await makeProxy('pk3'); const p2 = await makeProxy('pk4');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.usagePct = 5; p2.ctl.usagePct = 50;
+  const env = envFor([p1, p2], { API_KEY: 't-pinh', PIN_MODE: 'header' });
+  await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'conv-x' }, key: 't-pinh' }), env, {});
+  // admin 请求带 X-Sticky-Id
+  const pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pinh', 'X-Sticky-Id': 'conv-x' } }), env, {})).json();
+  assert.equal(pr.pinned_proxy, n1);
+  assert.equal(pr.sticky_key, 'h:conv-x');
+  // 不带 X-Sticky-Id → null
+  const pr2 = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer t-pinh' } }), env, {})).json();
+  assert.equal(pr2.pinned_proxy, null);
+});
+
+console.log('\n== 运行时配置 (后台管理代理/参数) ==');
+
+await t('RUN1 保存代理列表 → 立即生效, 路由用新代理 + 各自的 apiKey', async () => {
+  const pa = await makeProxy('ra'); const pb = await makeProxy('rb');
+  const env = envFor([pa], { API_KEY: 't-run1' }); // 环境变量只有 pa
+  pb.ctl.usagePct = 0; pa.ctl.usagePct = 50;
+  // 后台保存运行时配置: [ra, rb] (替换环境变量列表)
+  const save = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run1', 'Content-Type': 'application/json' }, body: JSON.stringify({ proxies: [
+    { name: 'ra', url: pa.url, apiKey: 'kA' },
+    { name: 'rb', url: pb.url, apiKey: 'kB' },
+  ] }) }), env, {});
+  assert.equal(save.status, 200);
+  // config 显示 runtime_managed + 完整列表
+  const cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-run1' } }), env, {})).json();
+  assert.equal(cfg.config.runtime_managed, true);
+  assert.equal(cfg.config.has_runtime_config, true);
+  assert.equal(cfg.config.proxies.length, 2);
+  // 路由到新列表中的最优 (rb, usage 0), 且用运行时保存的 apiKey 调下游
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-run1' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), 'rb');
+  assert.equal(pb.ctl.lastAuth, 'kB');
+});
+
+await t('RUN2 保存参数 → 生效 (pinMode/maxAttempts)', async () => {
+  const p = await makeProxy('rp');
+  const env = envFor([p], { API_KEY: 't-run2' });
+  const r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run2', 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { pinMode: 'header', maxAttempts: 2 } }) }), env, {});
+  assert.equal(r.status, 200);
+  const cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-run2' } }), env, {})).json();
+  assert.equal(cfg.config.pin_mode, 'header');
+  assert.equal(cfg.config.max_attempts, 2);
+});
+
+await t('RUN3 校验拒绝: 空列表/非法 URL/缺 key/重复名/非法参数 → 400', async () => {
+  const p = await makeProxy('rv');
+  const env = envFor([p], { API_KEY: 't-run3' });
+  const bad = [
+    { proxies: [] },
+    { proxies: [{ url: 'not-a-url', apiKey: 'k' }] },
+    { proxies: [{ url: 'https://x.com' }] },
+    { proxies: [{ name: 'a', url: 'https://x.com', apiKey: 'k' }, { name: 'a', url: 'https://y.com', apiKey: 'k' }] },
+    { settings: { pinMode: 'bogus' } },
+    { settings: { stateTtl: 5 } },
+  ];
+  for (const b of bad) {
+    const r = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run3', 'Content-Type': 'application/json' }, body: JSON.stringify(b) }), env, {});
+    assert.equal(r.status, 400, 'should reject: ' + JSON.stringify(b).slice(0, 70));
+  }
+});
+
+await t('RUN4 重置 → 清除运行时配置, 恢复环境变量', async () => {
+  const p = await makeProxy('rr');
+  const env = envFor([p], { API_KEY: 't-run4' });
+  await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run4', 'Content-Type': 'application/json' }, body: JSON.stringify({ proxies: [{ name: 'x1', url: 'https://example.com', apiKey: 'k' }] }) }), env, {});
+  const r = await worker.fetch(new Request('https://gw.example/admin/api/config/reset', { method: 'POST', headers: { Authorization: 'Bearer t-run4', 'Content-Type': 'application/json' }, body: '{}' }), env, {});
+  assert.equal(r.status, 200);
+  const cfg = await (await worker.fetch(new Request('https://gw.example/admin/api/config', { headers: { Authorization: 'Bearer t-run4' } }), env, {})).json();
+  assert.equal(cfg.config.runtime_managed, false);
+  assert.equal(cfg.config.has_runtime_config, false);
+  assert.equal(cfg.config.proxies.length, 1); // 回到环境变量的 1 个代理
 });
 
 // 收尾

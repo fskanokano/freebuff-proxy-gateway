@@ -49,11 +49,16 @@ const fakeOverview = {
 
 const fakeConfig = {
   config: {
-    proxies: ['proxy-a @ https://proxy-a.workers.dev', 'proxy-b @ https://proxy-b.vercel.app', 'proxy-c @ https://proxy-c.runsite.app'],
+    proxies: [
+      { name: 'proxy-a', url: 'https://proxy-a.workers.dev', apiKey: 'gw-key-111' },
+      { name: 'proxy-b', url: 'https://proxy-b.vercel.app', apiKey: 'gw-key-222' },
+      { name: 'proxy-c', url: 'https://proxy-c.runsite.app', apiKey: 'gw-key-333' },
+    ],
     pin_mode: 'client', pin_ttl: 3600, state_ttl: 60, depleted_probe: 300, down_probe: 120,
     probe_timeout: 3000, max_attempts: 3,
     admin_uses_api_key: true, admin_key_masked: null,
     api_key_masked: 'cli…789, cli…012', proxy_keys_masked: 'gw…111, gw…222, gw…333',
+    runtime_managed: false, has_runtime_config: false,
   },
 };
 
@@ -77,6 +82,11 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/admin/api/probe' || url.pathname === '/admin/api/maintenance') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  if (url.pathname === '/admin/api/pin') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ pin_mode: 'client', sticky_key: 'c:demo-key', pinned_proxy: 'proxy-b' }));
     return;
   }
   if (url.pathname === '/admin/api/smoke') {

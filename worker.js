@@ -934,6 +934,62 @@ async function setMaintenance(name, url, on, cfg) {
   }
 }
 
+// ─────────────────────────── 运行时配置 ───────────────────────────
+
+// 后台管理保存的运行时配置 (增删改代理 + 参数), 覆盖环境变量 (用户改动优先)。
+// 存 caches.default, TTL 30 天; 每次请求加载时应用; 可"重置为环境变量"。
+const RUNTIME_KEY = CACHE_ORIGIN + '/runtime-config';
+
+async function getRuntimeConfig() {
+  try {
+    const r = await caches.default.get(RUNTIME_KEY);
+    if (!r) return null;
+    const j = await r.json();
+    return j && typeof j === 'object' ? j : null;
+  } catch (e) { return null; }
+}
+
+async function setRuntimeConfig(rc) {
+  await caches.default.put(RUNTIME_KEY, new Response(JSON.stringify(rc), {
+    headers: { 'Content-Type': 'application/json' },
+  }), { ttl: 2592000 }); // 30 天
+}
+
+async function clearRuntimeConfig() {
+  await caches.default.delete(RUNTIME_KEY);
+}
+
+// 环境变量为基础配置, 叠加运行时覆盖。返回新的 cfg。
+async function applyRuntimeConfig(cfg) {
+  const rc = await getRuntimeConfig();
+  if (!rc) return cfg;
+  cfg._runtime = rc;
+  if (Array.isArray(rc.proxies) && rc.proxies.length > 0) {
+    const seen = new Set();
+    cfg.proxies = rc.proxies.map((p, i) => {
+      const url = String(p.url || '').replace(/\/+$/, '');
+      if (!/^https?:\/\/[^/]+/.test(url)) throw new Error('runtime proxy #' + (i + 1) + ': invalid url');
+      if (!p.apiKey) throw new Error('runtime proxy #' + (i + 1) + ': missing apiKey');
+      const name = String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1);
+      if (seen.has(name)) throw new Error('runtime config: duplicate proxy name ' + name);
+      seen.add(name);
+      return { name, url, apiKey: String(p.apiKey) };
+    });
+    cfg.runtimeProxies = true;
+  }
+  const s = rc.settings;
+  if (s && typeof s === 'object') {
+    if (typeof s.pinMode === 'string' && ['client', 'header', 'off'].includes(s.pinMode)) cfg.pinMode = s.pinMode;
+    if (Number.isFinite(s.pinTtl) && s.pinTtl >= 60) cfg.pinTtl = Math.floor(s.pinTtl);
+    if (Number.isFinite(s.stateTtl) && s.stateTtl >= 60) cfg.stateTtl = Math.floor(s.stateTtl);
+    if (Number.isFinite(s.depletedProbe) && s.depletedProbe >= 60) cfg.depletedProbe = Math.floor(s.depletedProbe);
+    if (Number.isFinite(s.downProbe) && s.downProbe >= 30) cfg.downProbe = Math.floor(s.downProbe);
+    if (Number.isFinite(s.probeTimeout) && s.probeTimeout >= 500) cfg.probeTimeout = Math.floor(s.probeTimeout);
+    if (Number.isFinite(s.maxAttempts) && s.maxAttempts >= 1 && s.maxAttempts <= 6) cfg.maxAttempts = Math.floor(s.maxAttempts);
+  }
+  return cfg;
+}
+
 // ─────────────────────────── 网关自身端点 ───────────────────────────
 
 async function handleGatewayHealth(cfg) {
@@ -1027,9 +1083,11 @@ async function adminOverview(cfg) {
 }
 
 async function adminConfig(cfg) {
+  const rc = cfg._runtime || null;
   return new Response(JSON.stringify({
     config: {
-      proxies: cfg.proxies.map(p => p.name + ' @ ' + p.url),
+      // 生效配置 (含运行时覆盖后的结果); proxies 带完整 apiKey (管理后台可见, 供编辑回填)
+      proxies: cfg.proxies.map(p => ({ name: p.name, url: p.url, apiKey: p.apiKey })),
       pin_mode: cfg.pinMode,
       pin_ttl: cfg.pinTtl,
       state_ttl: cfg.stateTtl,
@@ -1041,8 +1099,77 @@ async function adminConfig(cfg) {
       api_key_masked: cfg.clientKeys.map(maskKey).join(', '),
       admin_key_masked: cfg.adminKeyConfigured ? maskKey(cfg.adminKeys[0]) : null,
       proxy_keys_masked: cfg.proxies.map(p => maskKey(p.apiKey)).join(', '),
+      // 来源标记
+      runtime_managed: !!cfg.runtimeProxies,   // 代理列表来自后台运行时配置
+      has_runtime_config: !!rc,                // 是否存在后台保存的运行时配置
     },
   }), { headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+}
+
+// 保存运行时配置 (代理增删改 + 参数修改)。立即生效 (下次请求); cache 跨边缘传播有短暂延迟。
+async function adminSaveConfig(req, cfg) {
+  let body = {};
+  try { body = await req.json(); } catch (e) { return errorResponse(400, 'invalid_config', 'invalid JSON body', {}); }
+  const rc = {};
+  if (body.proxies !== undefined) {
+    if (!Array.isArray(body.proxies) || body.proxies.length === 0) {
+      return errorResponse(400, 'invalid_config', 'proxies must be a non-empty array of {name?,url,apiKey}', {});
+    }
+    const seen = new Set();
+    for (let i = 0; i < body.proxies.length; i++) {
+      const p = body.proxies[i];
+      const url = String(p.url || '').replace(/\/+$/, '');
+      if (!/^https?:\/\/[^/]+/.test(url)) return errorResponse(400, 'invalid_config', 'proxy #' + (i + 1) + ': invalid url', {});
+      if (!p.apiKey) return errorResponse(400, 'invalid_config', 'proxy #' + (i + 1) + ': missing apiKey', {});
+      const name = String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1);
+      if (seen.has(name)) return errorResponse(400, 'invalid_config', 'duplicate proxy name: ' + name, {});
+      seen.add(name);
+    }
+    rc.proxies = body.proxies.map((p, i) => ({
+      name: String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1),
+      url: String(p.url).replace(/\/+$/, ''),
+      apiKey: String(p.apiKey),
+    }));
+  }
+  if (body.settings !== undefined) {
+    if (typeof body.settings !== 'object' || body.settings === null) {
+      return errorResponse(400, 'invalid_config', 'settings must be an object', {});
+    }
+    const s = body.settings;
+    if (s.pinMode !== undefined && !['client', 'header', 'off'].includes(s.pinMode)) return errorResponse(400, 'invalid_config', 'pinMode must be client|header|off', {});
+    for (const [k, min] of [['pinTtl', 60], ['stateTtl', 60], ['depletedProbe', 60], ['downProbe', 30], ['probeTimeout', 500]]) {
+      if (s[k] !== undefined && (!Number.isFinite(s[k]) || s[k] < min)) return errorResponse(400, 'invalid_config', k + ' must be >= ' + min, {});
+    }
+    if (s.maxAttempts !== undefined && (!Number.isFinite(s.maxAttempts) || s.maxAttempts < 1 || s.maxAttempts > 6)) return errorResponse(400, 'invalid_config', 'maxAttempts must be 1-6', {});
+    rc.settings = {
+      ...(s.pinMode !== undefined ? { pinMode: s.pinMode } : {}),
+      ...(s.pinTtl !== undefined ? { pinTtl: Math.floor(s.pinTtl) } : {}),
+      ...(s.stateTtl !== undefined ? { stateTtl: Math.floor(s.stateTtl) } : {}),
+      ...(s.depletedProbe !== undefined ? { depletedProbe: Math.floor(s.depletedProbe) } : {}),
+      ...(s.downProbe !== undefined ? { downProbe: Math.floor(s.downProbe) } : {}),
+      ...(s.probeTimeout !== undefined ? { probeTimeout: Math.floor(s.probeTimeout) } : {}),
+      ...(s.maxAttempts !== undefined ? { maxAttempts: Math.floor(s.maxAttempts) } : {}),
+    };
+  }
+  if (!rc.proxies && !rc.settings) return errorResponse(400, 'invalid_config', 'nothing to save (provide proxies and/or settings)', {});
+  await setRuntimeConfig(rc);
+  pushEvent(cfg, 'admin_action', {
+    action: 'save_config',
+    proxies: rc.proxies ? rc.proxies.length : null,
+    settings: rc.settings ? Object.keys(rc.settings).join(',') : null,
+  });
+  return new Response(JSON.stringify({ saved: true, note: '运行时配置已保存并立即生效 (跨边缘传播可能延迟几秒)' }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+// 清除运行时配置, 回到环境变量
+async function adminResetConfig(cfg) {
+  await clearRuntimeConfig();
+  pushEvent(cfg, 'admin_action', { action: 'reset_config' });
+  return new Response(JSON.stringify({ reset: true, note: '已清除运行时配置, 恢复为环境变量' }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
 }
 
 // 强制探测: 全部或单个 proxy (绕过 nextProbe 节流)
@@ -1086,6 +1213,20 @@ async function adminPin(req, cfg) {
   } catch (e) {}
   pushEvent(cfg, 'admin_action', { action: 'clear_pin', key });
   return new Response(JSON.stringify({ cleared: true, key }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+// 当前管理会话的钉住状态 (常驻代理): 返回当前 sticky key 命中的 proxy
+async function adminPinStatus(req, cfg) {
+  const sticky = stickyKeyFor(req, cfg);
+  if (!sticky) {
+    return new Response(JSON.stringify({ pin_mode: cfg.pinMode, sticky_key: null, pinned_proxy: null }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    });
+  }
+  const pinned = await getPin(sticky, cfg);
+  return new Response(JSON.stringify({ pin_mode: cfg.pinMode, sticky_key: sticky, pinned_proxy: pinned }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
   });
 }
@@ -1197,7 +1338,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     let cfg;
-    try { cfg = parseEnv(env); }
+    try {
+      cfg = parseEnv(env);
+      cfg = await applyRuntimeConfig(cfg); // 运行时配置覆盖环境变量 (用户后台改动优先)
+    }
     catch (e) {
       // 诊断辅助: 回显"当前运行时实际收到的环境变量名" (只列名不列值, 不含系统注入的), 
       // 方便定位"配置了但没生效"的问题 (常见于把变量配到了 Build settings 而非
@@ -1238,9 +1382,12 @@ export default {
         case 'GET /overview': return adminOverview(cfg);
         case 'GET /config': return adminConfig(cfg);
         case 'GET /models': return handleModels(request, cfg);
+        case 'POST /config': return adminSaveConfig(request, cfg);
+        case 'POST /config/reset': return adminResetConfig(cfg);
         case 'POST /probe': return adminProbe(request, cfg);
         case 'POST /maintenance': return adminMaintenance(request, cfg);
         case 'POST /pin': return adminPin(request, cfg);
+        case 'GET /pin': return adminPinStatus(request, cfg);
         case 'POST /smoke': return adminSmoke(request, cfg);
         default: return errorResponse(404, 'not_found', 'unknown admin api: ' + apiPath, {});
       }

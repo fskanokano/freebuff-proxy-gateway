@@ -6,15 +6,8 @@
   "observability": {
     "enabled": true
   },
-  "keep_vars": true,
-  "vars": {
-    "PIN_MODE": "client",
-    "PIN_TTL_SECONDS": "3600",
-    "STATE_TTL_SECONDS": "60",
-    "DEPLETED_PROBE_SECONDS": "300",
-    "DOWN_PROBE_SECONDS": "120",
-    "PROBE_TIMEOUT_MS": "3000",
-    "MAX_ATTEMPTS": "3",
-    "LOG_LEVEL": "info"
-  }
+  // 不注入任何 vars: 默认值已内置于代码 (parseEnv DEFAULTS),
+  // 避免 wrangler 部署时用仓库 vars 覆盖用户在 Variables & Secrets 里的配置。
+  // keep_vars 保证 dashboard 手动添加的变量不被部署删除。
+  "keep_vars": true
 }

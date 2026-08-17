@@ -86,6 +86,14 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .pill.unknown{background:var(--fill);color:var(--text2)}
 .pill.bad_config{background:rgba(175,82,222,.15);color:var(--purple)}
 .pill.maint{background:rgba(175,82,222,.15);color:var(--purple)}
+.pill.pinned{background:rgba(0,122,255,.14);color:var(--blue)}
+/* ── 常驻代理信息条 ── */
+.pin-banner{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--card);
+  border-radius:var(--radius);box-shadow:var(--shadow);padding:12px 16px;margin-bottom:14px}
+.pin-banner .pin-name{font-weight:700;color:var(--blue)}
+.pin-banner .pin-sub{font-size:12px;color:var(--text3);margin-top:2px}
+.pin-banner .pin-clear{background:var(--fill);color:var(--blue);border-radius:var(--radius-sm);padding:7px 14px;font-size:13px;font-weight:600;min-height:36px}
+.proxy.pinned{box-shadow:0 0 0 2px rgba(0,122,255,.35),var(--shadow)}
 /* ── proxy 卡片 ── */
 .proxy{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:12px;overflow:hidden}
 .proxy-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 0}
@@ -191,6 +199,18 @@ h2.section{font-size:22px;font-weight:700;letter-spacing:-.02em;margin:2px 0 14p
     <div class="login-err" id="loginErr"></div>
   </div>
 </div>
+<div class="login" id="proxyModal">
+  <div class="login-card">
+    <h2 id="pmTitle">添加代理</h2>
+    <p>保存后立即生效 (跨边缘传播可能延迟几秒)</p>
+    <div class="field"><label>名称 (可选)</label><input class="input" id="pmName" placeholder="如 proxy-d (留空自动生成)"></div>
+    <div class="field"><label>URL *</label><input class="input" id="pmUrl" placeholder="https://xxx.workers.dev"></div>
+    <div class="field"><label>API Key * (网关调用该代理的 key)</label><input class="input" id="pmKey" placeholder="该代理 API_KEYS 中配置的 key"></div>
+    <div style="margin-top:14px"><button class="btn" id="pmSave">保存</button></div>
+    <div style="margin-top:8px"><button class="btn secondary" id="pmCancel">取消</button></div>
+    <div class="login-err" id="pmErr"></div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 <script>
 "use strict";
@@ -294,7 +314,11 @@ function proxyCard(pr){
     '<div class="proxy-head"><div><div class="proxy-name">'+esc(pr.name)+" "+pill(pr.status,pr.maint)+"</div>"+
     '<div class="proxy-url">'+esc(pr.url)+"</div></div>"+
     '<div class="proxy-actions"><button class="icon-btn p-probe" title="立即探测" style="font-size:15px">&#x21bb;</button>'+
-    '<div class="switch'+(pr.maint?" on":"")+'" data-maint="1" title="维护模式"></div></div></div>'+
+    // 开关语义 = 是否启用: 正常(非维护)=开, 维护=关
+    '<div class="switch'+(pr.maint?"":" on")+'" data-maint="1" title="代理启用开关 (关 = 进入维护)"></div>'+
+    '<button class="icon-btn p-edit" title="编辑代理" style="font-size:14px">&#x270e;</button>'+
+    '<button class="icon-btn p-del" title="删除代理" style="font-size:14px;color:var(--red)">&#x2715;</button>'+
+    '</div></div>'+
     '<div class="card-body">'+
     '<div class="bar '+barCls+'"><i style="width:'+Math.round(pr.score)+'%"></i></div>'+
     '<div class="bar-row"><span>估算用量 '+Math.round(pr.score)+"%</span><span>余量 "+(100-Math.round(pr.score))+"%</span></div>"+
@@ -309,9 +333,27 @@ function proxyCard(pr){
 }
 function renderProxies(d){
   var el=$("#view-proxies");
-  el.innerHTML='<h2 class="section">代理</h2><div class="sub">点击 <b>探测</b> 立即刷新状态, 开关控制维护模式 (维护中的代理不参与选路)</div>';
+  el.innerHTML='<h2 class="section">代理</h2>'+
+    '<div class="sub">开关 = 代理启用状态 (关 = 进入维护, 不参与选路); 支持添加/编辑/删除代理</div>'+
+    '<div id="pinBanner"></div>'+
+    '<div style="margin-bottom:14px"><button class="btn" id="addProxyBtn" style="min-height:40px">＋ 添加代理</button></div>';
   if(!d.proxies.length)el.insertAdjacentHTML("beforeend",'<div class="card"><div class="empty">未配置任何代理</div></div>');
   d.proxies.forEach(function(pr){el.insertAdjacentHTML("beforeend",proxyCard(pr))});
+  // 加载完整配置 (含 apiKey) 供编辑
+  api("/config").then(function(cd){
+    _cfgProxies=(cd.config&&cd.config.proxies||[]).slice();
+  }).catch(function(){});
+  // 当前常驻代理 (sticky pin) 状态
+  api("/pin").then(function(pd){
+    renderPinBanner(pd);
+    if(pd&&pd.pinned_proxy){
+      var card=el.querySelector('.proxy[data-name="'+pd.pinned_proxy+'"]');
+      if(card){
+        card.classList.add("pinned");
+        card.querySelector(".proxy-name").insertAdjacentHTML("beforeend",' <span class="pill pinned">常驻</span>');
+      }
+    }
+  }).catch(function(){});
   // 直接为每个卡片绑定事件 (比事件委托更可靠, 避免代理名/嵌套导致 closest 失效)
   el.querySelectorAll(".proxy").forEach(function(card){
     var name=card.dataset.name;
@@ -325,21 +367,51 @@ function renderProxies(d){
     var sw=card.querySelector(".switch");
     sw.onclick=function(e){
       e.preventDefault();e.stopPropagation();
-      var on=!sw.classList.contains("on");
+      // 开关开着(=启用中) → 点击进入维护; 开关关着(=维护中) → 点击恢复
+      var enterMaint=sw.classList.contains("on");
       sw.style.pointerEvents="none"; // 防连点
-      // 乐观切换 UI: 立即反馈, 不被 refresh 用旧数据弹回
-      sw.classList.toggle("on",on);
+      sw.classList.toggle("on",!enterMaint); // 乐观切换
       state.skipProxyRefreshUntil=Date.now()+4000; // 4s 内轮询不重绘代理页
-      api("/maintenance",{method:"POST",body:JSON.stringify({name:name,on:on})}).then(function(){
-        toast(on?"已进入维护模式":"已恢复");
+      api("/maintenance",{method:"POST",body:JSON.stringify({name:name,on:enterMaint})}).then(function(){
+        toast(enterMaint?"已进入维护模式 (代理暂停)":"已恢复 (代理启用)");
         setTimeout(function(){state.skipProxyRefreshUntil=0;refresh()},1200);
       }).catch(function(e){
-        sw.classList.toggle("on",!on); // 失败回滚
+        sw.classList.toggle("on",enterMaint); // 失败回滚
         state.skipProxyRefreshUntil=0;
         toast("设置失败: "+e.message);
       }).finally(function(){sw.style.pointerEvents=""});
     };
+    card.querySelector(".p-edit").onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      var p=_cfgProxies.find(function(x){return x.name===name})||{name:name,url:card.querySelector(".proxy-url").innerText,apiKey:""};
+      _pmEditingName=p.name;
+      openProxyModal(p);
+    };
+    card.querySelector(".p-del").onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      if(!confirm("确定删除代理 "+name+" ?"))return;
+      var list=_cfgProxies.filter(function(x){return x.name!==name});
+      saveProxies(list,"代理已删除");
+    };
   });
+  $("#addProxyBtn").onclick=function(){openProxyModal(null)};
+}
+// 常驻代理信息条: 当前管理会话 (sticky key) 命中的钉住代理
+function renderPinBanner(pd){
+  var el=$("#pinBanner");if(!el)return;
+  if(!pd||!pd.pinned_proxy){
+    el.innerHTML='<div class="pin-banner"><div><div>当前会话 <b>未常驻</b> 任何代理</div>'+
+      '<div class="pin-sub">按余量实时选路 · PIN_MODE='+esc(pd?pd.pin_mode:"-")+' · 每次请求成功后自动钉住所选代理</div></div></div>';
+    return;
+  }
+  el.innerHTML='<div class="pin-banner"><div><div>当前常驻代理: <span class="pin-name">'+esc(pd.pinned_proxy)+'</span></div>'+
+    '<div class="pin-sub">本会话请求持续路由到该代理, 直到其额度耗尽后自动切换 · 键: '+esc(pd.sticky_key||"-")+'</div></div>'+
+    '<button class="pin-clear" id="pinClearBtn">解除常驻</button></div>';
+  $("#pinClearBtn").onclick=function(){
+    if(!confirm("解除当前会话的常驻代理? 下次请求将按余量重新选路"))return;
+    var key=(pd.sticky_key||"").replace(/^[ch]:/,"");
+    api("/pin",{method:"POST",body:JSON.stringify({key:key})}).then(function(){toast("已解除常驻");refresh()}).catch(function(e){toast("解除失败: "+e.message)});
+  };
 }
 /* ── 渲染: 日志 ── */
 function renderEvents(d){
@@ -419,32 +491,74 @@ function toCustomModel(sel){
   wrap.replaceChild(input,sel);
   input.focus();
 }
-/* ── 渲染: 设置 ── */
+/* ── 渲染: 设置 (参数可编辑) ── */
 function renderSettings(d){
   var el=$("#view-settings");
   var c=d.config||{};
-  var rows=[["PROXIES",c.proxies],["PIN_MODE",c.pin_mode],["PIN_TTL (s)",c.pin_ttl],["STATE_TTL (s)",c.state_ttl],
-    ["DEPLETED_PROBE (s)",c.depleted_probe],["DOWN_PROBE (s)",c.down_probe],["PROBE_TIMEOUT (ms)",c.probe_timeout],
-    ["MAX_ATTEMPTS",c.max_attempts]];
-  // 鉴权: ADMIN_KEY 未单独配置时, 管理后台复用 API_KEY (显示一行, 不重复)
+  _cfgProxies=(c.proxies||[]).slice();
+  var srcNote=c.has_runtime_config
+    ? '配置来源: <b>后台运行时配置</b> (用户改动优先; 环境变量为初始值, 部署后仍以这里为准)'
+    : '配置来源: <b>环境变量</b> (默认值内置于代码)';
+  var authRows='';
   if(c.admin_uses_api_key){
-    rows.push(["API_KEY / 管理后台鉴权", c.api_key_masked]);
-    rows.push(["注", "(ADMIN_KEY 未配置, 管理后台与客户端共用 API_KEY)"]);
+    authRows='<div class="cell"><div class="cell-label">API_KEY / 管理后台鉴权</div><div class="cell-value mono" style="font-size:12px">'+esc(c.api_key_masked)+"</div></div>"+
+      '<div class="cell"><div class="cell-label">注</div><div class="cell-value" style="font-size:12px;color:var(--text3)">ADMIN_KEY 未配置, 管理后台与客户端共用 API_KEY</div></div>';
   }else{
-    rows.push(["API_KEY (客户端)", c.api_key_masked]);
-    rows.push(["ADMIN_KEY (管理后台)", c.admin_key_masked]);
+    authRows='<div class="cell"><div class="cell-label">API_KEY (客户端)</div><div class="cell-value mono" style="font-size:12px">'+esc(c.api_key_masked)+'</div></div>'+
+      '<div class="cell"><div class="cell-label">ADMIN_KEY (管理后台)</div><div class="cell-value mono" style="font-size:12px">'+esc(c.admin_key_masked)+"</div></div>";
   }
-  rows.push(["GATEWAY_API_KEYS (下游)", c.proxy_keys_masked]);
-  var html='<h2 class="section">设置</h2><div class="sub">当前生效配置 (密钥已脱敏)</div><div class="card"><div class="card-body">';
-  rows.forEach(function(r){html+='<div class="cell"><div class="cell-label">'+esc(r[0])+'</div><div class="cell-value mono" style="font-size:12px;max-width:60%">'+esc(r[1]||"—")+"</div></div>"});
-  html+='<div class="cell"><div class="cell-label">外观</div><div class="cell-value"><button class="btn secondary" style="width:auto;min-height:36px;padding:7px 14px;font-size:14px" id="themeBtn">切换外观</button></div></div>'+
-  '<div class="cell"><div class="cell-label">清除已保存的密钥</div><div class="cell-value"><button class="btn danger" style="width:auto;min-height:36px;padding:7px 14px;font-size:14px" id="logoutBtn">退出登录</button></div></div>'+
-  "</div></div>";
+  authRows+='<div class="cell"><div class="cell-label">GATEWAY_API_KEYS (下游)</div><div class="cell-value mono" style="font-size:12px">'+esc(c.proxy_keys_masked)+"</div></div>";
+  var html='<h2 class="section">设置</h2><div class="sub">'+srcNote+'</div>'+
+    '<div class="card"><div class="card-head"><div class="card-title">路由参数 (可修改, 保存后立即生效)</div></div><div class="card-body">'+
+    '<div class="field"><label>PIN_MODE 钉住模式</label><select class="input" id="sPinMode">'+
+      '<option value="client"'+(c.pin_mode==="client"?" selected":"")+'>client (按客户端 key)</option>'+
+      '<option value="header"'+(c.pin_mode==="header"?" selected":"")+'>header (按 X-Sticky-Id)</option>'+
+      '<option value="off"'+(c.pin_mode==="off"?" selected":"")+'>off (不钉住)</option></select></div>'+
+    '<div class="field"><label>PIN_TTL 钉住有效期 (秒)</label><input class="input" id="sPinTtl" type="number" min="60" value="'+esc(c.pin_ttl)+'"></div>'+
+    '<div class="field"><label>STATE_TTL 状态刷新 (秒, ≥60)</label><input class="input" id="sStateTtl" type="number" min="60" value="'+esc(c.state_ttl)+'"></div>'+
+    '<div class="field"><label>DEPLETED_PROBE 耗尽探测退避 (秒, ≥60)</label><input class="input" id="sDepletedProbe" type="number" min="60" value="'+esc(c.depleted_probe)+'"></div>'+
+    '<div class="field"><label>DOWN_PROBE 故障探测退避 (秒, ≥30)</label><input class="input" id="sDownProbe" type="number" min="30" value="'+esc(c.down_probe)+'"></div>'+
+    '<div class="field"><label>PROBE_TIMEOUT 探测超时 (毫秒, ≥500)</label><input class="input" id="sProbeTimeout" type="number" min="500" value="'+esc(c.probe_timeout)+'"></div>'+
+    '<div class="field"><label>MAX_ATTEMPTS 最大尝试次数 (1-6)</label><input class="input" id="sMaxAttempts" type="number" min="1" max="6" value="'+esc(c.max_attempts)+'"></div>'+
+    '<div style="display:flex;gap:8px"><button class="btn" id="sSave" style="flex:1">保存参数</button>'+
+    (c.has_runtime_config?'<button class="btn danger" id="sReset" style="flex:1">恢复环境变量</button>':'')+'</div>'+
+    '</div></div>'+
+    '<div class="card"><div class="card-head"><div class="card-title">鉴权 (密钥已脱敏)</div></div><div class="card-body">'+authRows+"</div></div>"+
+    '<div class="card"><div class="card-head"><div class="card-title">当前代理列表 (编辑在「代理」页)</div></div><div class="card-body" id="sProxies"></div></div>'+
+    '<div class="card"><div class="card-head"><div class="card-title">界面</div></div><div class="card-body">'+
+    '<div class="cell"><div class="cell-label">外观</div><div class="cell-value" style="display:flex;gap:6px"><button class="btn secondary" style="width:auto;min-height:36px;padding:7px 14px;font-size:14px" id="themeBtn">浅色/深色切换</button><button class="btn secondary" style="width:auto;min-height:36px;padding:7px 14px;font-size:14px" id="themeAutoBtn">跟随系统</button></div></div>'+
+    '<div class="cell"><div class="cell-label">清除已保存的密钥</div><div class="cell-value"><button class="btn danger" style="width:auto;min-height:36px;padding:7px 14px;font-size:14px" id="logoutBtn">退出登录</button></div></div>'+
+    '</div></div>';
   el.innerHTML=html;
-  $("#themeBtn").onclick=function(){
-    state.theme=state.theme==="auto"?(matchMedia("(prefers-color-scheme:dark)").matches?"light":"dark"):(state.theme==="dark"?"light":"dark");
-    applyTheme();localStorage.setItem("gwtheme",state.theme);
+  // 代理列表 (只读展示, 编辑在代理页)
+  var pl=$("#sProxies");pl.innerHTML="";
+  _cfgProxies.forEach(function(p){
+    var row=document.createElement("div");row.className="cell";
+    row.innerHTML='<div style="min-width:0"><div style="font-weight:600">'+esc(p.name)+'</div><div style="font-size:12px;color:var(--text3);word-break:break-all">'+esc(p.url)+"</div></div>"+
+      '<div class="cell-value mono" style="font-size:12px">'+esc(maskKey(p.apiKey))+"</div>";
+    pl.appendChild(row);
+  });
+  // 保存参数
+  $("#sSave").onclick=function(){
+    var settings={
+      pinMode:$("#sPinMode").value,
+      pinTtl:parseInt($("#sPinTtl").value,10),
+      stateTtl:parseInt($("#sStateTtl").value,10),
+      depletedProbe:parseInt($("#sDepletedProbe").value,10),
+      downProbe:parseInt($("#sDownProbe").value,10),
+      probeTimeout:parseInt($("#sProbeTimeout").value,10),
+      maxAttempts:parseInt($("#sMaxAttempts").value,10)
+    };
+    api("/config",{method:"POST",body:JSON.stringify({settings:settings})}).then(function(){
+      toast("参数已保存");refresh();
+    }).catch(function(e){toast("保存失败: "+e.message)});
   };
+  if($("#sReset"))$("#sReset").onclick=function(){
+    if(!confirm("清除后台运行时配置并恢复为环境变量? (后台改的代理也会还原)"))return;
+    api("/config/reset",{method:"POST",body:"{}"}).then(function(){toast("已恢复环境变量");refresh()}).catch(function(e){toast(e.message)});
+  };
+  $("#themeBtn").onclick=function(){cycleTheme()};
+  $("#themeAutoBtn").onclick=function(){state.theme="auto";applyTheme();localStorage.setItem("gwtheme","auto");toast("已跟随系统外观")};
   $("#logoutBtn").onclick=function(){state.key="";localStorage.removeItem("gwkey");showLogin("")};
 }
 /* ── 刷新 ── */
@@ -459,6 +573,38 @@ function renderCurrent(){
 }
 function refresh(){renderCurrent()}
 function noop(){}
+function maskKey(k){if(!k)return"—";if(String(k).length<=6)return String(k)[0]+"***";var s=String(k);return s.slice(0,3)+"…"+s.slice(-3)}
+/* ── 代理管理 (添加/编辑/删除) ── */
+var _cfgProxies=[]; // 当前生效代理 (含 apiKey), 来自 /admin/api/config
+function openProxyModal(p){
+  $("#pmTitle").textContent=p?"编辑代理 "+p.name:"添加代理";
+  $("#pmName").value=p?p.name:"";
+  $("#pmUrl").value=p?p.url:"";
+  $("#pmKey").value=p?p.apiKey:"";
+  $("#pmErr").textContent="";
+  $("#proxyModal").classList.add("show");
+  setTimeout(function(){$("#pmUrl").focus()},100);
+}
+function closeProxyModal(){$("#proxyModal").classList.remove("show")}
+function saveProxies(list,msg){
+  api("/config",{method:"POST",body:JSON.stringify({proxies:list})}).then(function(){
+    toast(msg||"已保存");_cfgProxies=list.slice();closeProxyModal();refresh();
+  }).catch(function(e){toast("保存失败: "+e.message)});
+}
+function submitProxyForm(){
+  var url=$("#pmUrl").value.trim(),key=$("#pmKey").value.trim(),name=$("#pmName").value.trim();
+  if(!/^https?:\\/\\/[^/]+/.test(url)){$("#pmErr").textContent="URL 格式不对, 如 https://xxx.workers.dev";return}
+  if(!key){$("#pmErr").textContent="请填写该代理的 API Key";return}
+  var editing=_cfgProxies.find(function(x){return x.name===_pmEditingName});
+  var list;
+  if(editing){
+    list=_cfgProxies.map(function(x){return x.name===_pmEditingName?{name:name,url:url,apiKey:key}:x});
+  }else{
+    list=_cfgProxies.concat([{name:name,url:url,apiKey:key}]);
+  }
+  saveProxies(list,"代理已保存");
+}
+var _pmEditingName=null;
 function updateDot(d){
   var dot=$("#navDot");
   if(!d||!d.proxies)return;
@@ -477,6 +623,13 @@ function applyTheme(){
   document.body.classList.toggle("theme-dark",dark);
   document.body.classList.toggle("theme-light",!dark);
 }
+// 主题切换: 基于当前视觉状态直接切换亮/暗 (一次点击直达, 不经过 auto 中间态)
+function cycleTheme(){
+  var dark=document.body.classList.contains("theme-dark");
+  state.theme=dark?"light":"dark";
+  applyTheme();
+  localStorage.setItem("gwtheme",state.theme);
+}
 (function(){
   buildNav();applyTheme();
   // 首次加载: 显示当前 view (修整页空白), 有 key 则直接渲染
@@ -490,11 +643,12 @@ function applyTheme(){
     }).catch(function(e){state.key="";$("#loginErr").textContent=e.message});
   };
   $("#loginKey").addEventListener("keydown",function(e){if(e.key==="Enter")$("#loginBtn").click()});
+  // 代理编辑模态框
+  $("#pmSave").onclick=function(){submitProxyForm()};
+  $("#pmCancel").onclick=function(){closeProxyModal()};
+  $("#pmUrl").addEventListener("keydown",function(e){if(e.key==="Enter")submitProxyForm()});
   $("#btnRefresh").onclick=function(){refresh()};
-  $("#btnTheme").onclick=function(){
-    state.theme=state.theme==="dark"?"light":(state.theme==="light"?"auto":"dark");
-    applyTheme();localStorage.setItem("gwtheme",state.theme);
-  };
+  $("#btnTheme").onclick=function(){cycleTheme()};
   if(state.key){
     api("/overview").then(function(d){hideLogin();updateDot(d);renderCurrent()}).catch(function(){showLogin("")});
   }else showLogin("");
