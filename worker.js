@@ -854,7 +854,7 @@ async function routeRequest(req, cfg, body, opts = {}) {
       h.set('x-gateway-attempts', String(attempts.length));
       if (isChat && sticky) h.set('x-gateway-pin', st.name);
       // 路由记录: 每次成功响应一条 (含 failover 尝试次数)
-      pushRoute(cfg, { name: st.name, status: cl.resp.status, attempts: attempts.length, ms: nowMs() - reqStarted, model: model || null, ok: true });
+      queueRoute(cfg, { name: st.name, status: cl.resp.status, attempts: attempts.length, ms: nowMs() - reqStarted, model: model || null, ok: true }, opts.waitUntil);
       return new Response(cl.resp.body, { status: cl.resp.status, headers: h });
     }
 
@@ -878,14 +878,14 @@ async function routeRequest(req, cfg, body, opts = {}) {
   const agg = aggregateError(attempts, cfg);
   // 路由记录: 全部尝试失败的情况 (记录最终状态与最后尝试的代理)
   const last = attempts[attempts.length - 1];
-  pushRoute(cfg, {
+  queueRoute(cfg, {
     name: last ? last.name : null,
     status: agg.passthrough ? agg.resp.status : (agg.error ? agg.error.status : 502),
     attempts: attempts.length,
     ms: nowMs() - reqStarted,
     model: model || null,
     ok: false,
-  });
+  }, opts.waitUntil);
   if (agg.passthrough) {
     // x-gateway-proxy 必须指实际产生该 surface 响应的 proxy —— 前面可能已尝试过
     // 5xx/quota 的 proxy (attempts[0] 不一定是 surface 那个), 用 agg.name。
@@ -963,15 +963,21 @@ let routeFlushChain = Promise.resolve(); // 串行化同 isolate 落盘, 防并�
 
 function pushRoute(cfg, detail) {
   ROUTE_L1.push({ t: nowMs(), ...detail });
-  // 每推必落盘 (不再攒 10 条才 flush): 低流量/多 isolate 部署下, 旧逻辑里日志会一直滞留
-  // 在本 isolate 的 L1 里, 管理后台 (常常命中别的 isolate) 永远看不到。同 isolate 串行写,
-  // 跨 isolate 最后写者胜 (尽力而为, 与事件日志同一策略)。
+  // 每推必落盘; 返回 promise 供 fetch(ctx).waitUntil 托管到响应结束后。
   routeFlushChain = routeFlushChain.then(() => flushRoutes(cfg)).catch(() => {});
+  return routeFlushChain;
+}
+
+function queueRoute(cfg, detail, waitUntil) {
+  const task = pushRoute(cfg, detail);
+  if (typeof waitUntil === 'function') waitUntil(task);
+  return task;
 }
 
 async function flushRoutes(cfg) {
   if (ROUTE_L1.length === 0) return;
-  const batch = ROUTE_L1.splice(0);
+  // 先复制, 写入成功后再从 L1 删除; 写失败则保留, 后续请求/后台读取可重试。
+  const batch = ROUTE_L1.slice();
   try {
     let list = [];
     const r = await caches.default.get(ROUTES_KEY);
@@ -981,7 +987,12 @@ async function flushRoutes(cfg) {
     await caches.default.put(ROUTES_KEY, new Response(JSON.stringify(list), {
       headers: { 'Content-Type': 'application/json' },
     }), { ttl: 86400 });
-  } catch (e) { /* 尽力而为 */ }
+    // 只移除本次写入的前缀; 写入期间新到的记录保留给下一轮。
+    ROUTE_L1.splice(0, batch.length);
+  } catch (e) {
+    // 保留 batch, 不能因一次 Cache API 暂时失败丢掉路由记录
+    throw e;
+  }
 }
 
 async function readRoutes() {
@@ -1639,6 +1650,9 @@ export default {
       return handleModels(request, cfg);
     }
 
-    return routeRequest(request, cfg, body, { noReplay: bodyNoReplay });
+    return routeRequest(request, cfg, body, {
+      noReplay: bodyNoReplay,
+      waitUntil: ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx) : null,
+    });
   },
 };
