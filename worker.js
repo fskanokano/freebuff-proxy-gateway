@@ -52,6 +52,8 @@ const DEFAULTS = {
   CHAT_TIMEOUT_MS: 120000,       // 非流式 chat 单次尝试超时 (流式不受限, 由客户端断开兜底)
   MAX_ATTEMPTS: 3,               // 单请求最大尝试 proxy 数
   LOG_LEVEL: 'info',             // debug | info | warn
+  LOG_TTL_SECONDS: 3600,         // 路由/事件日志持久化 TTL (1h, 配合 DO 定时清理防打满)
+  PROBE_MODE: 'smart',           // smart(默认) 只探测将用代理 | scan 无钉住时全量探测选最优
 };
 
 // 从 URL host 第一段生成 proxy 名字 (显示用): https://proxy-a.workers.dev → "proxy-a"
@@ -148,6 +150,8 @@ function parseEnv(env) {
   // 刻意不用 probeTimeout(3s): 非流式补全等待模型生成, 3s 会杀掉正常请求。
   cfg.chatTimeout = Math.max(1000, Math.floor(Number(cfg.CHAT_TIMEOUT_MS) || 120000));
   cfg.maxAttempts = Math.max(1, Math.min(6, Math.floor(Number(cfg.MAX_ATTEMPTS) || 3)));
+  cfg.logTtl = Math.max(60, Math.floor(Number(cfg.LOG_TTL_SECONDS) || 3600));
+  cfg.probeMode = ['smart', 'scan'].includes(String(cfg.PROBE_MODE).toLowerCase()) ? String(cfg.PROBE_MODE).toLowerCase() : 'smart';
   cfg.debug = String(cfg.LOG_LEVEL).toLowerCase() === 'debug';
 
   // PROXIES: 逗号分隔的下游 base URL (至少 1 个, 单 proxy 也完全支持)
@@ -572,19 +576,64 @@ async function setPin(sticky, proxyName, cfg) {
 
 // ─────────────────────────── 选路 ───────────────────────────
 
+// 智能探测的"首选"决策: 只在将要实际使用的代理上做探测。
+// 返回需要探测的 proxy name (常驻 pin 或按缓存状态选出的最佳候选), 其余节点只读缓存。
+function pickPreferred(states, usable, pinned) {
+  const idx = states.map((s, i) => i);
+  if (pinned) {
+    const pi = idx.find(i => states[i].name === pinned);
+    if (pi !== undefined && usable(states[pi], pi) &&
+        (states[pi].status === 'ok' || states[pi].status === 'unknown')) {
+      return states[pi].name;
+    }
+  }
+  // 无有效 pin: 在健康/未知候选里做"无探测"的负载均衡 (LRU: 最久没用/从未用过优先)。
+  // 绝不为"选最优"去整池探测 —— 那会白白烧掉空闲代理的额度。
+  const healthy = idx.filter(i => usable(states[i], i) && (states[i].status === 'ok' || states[i].status === 'unknown'));
+  if (healthy.length) {
+    healthy.sort((a, b) => {
+      const la = states[a].lastUsed || 0, lb = states[b].lastUsed || 0;
+      if (la !== lb) return la - lb;              // 最久没用 → 优先 (轮转分布)
+      return states[a].score - states[b].score;   // 同 recency → 余量多优先
+    });
+    return states[healthy[0]].name;
+  }
+  // 全部 depleted/down/bad_config: 选恢复最早的 (其 nextProbe 到期时 ensureFresh 会懒探测)
+  const rest = idx.filter(i => usable(states[i], i));
+  if (!rest.length) return states[0] ? states[0].name : null; // 全部维护中: 兜底 (会被 usable 排除)
+  rest.sort((a, b) => {
+    const ta = states[a].resetAt > nowMs() ? states[a].resetAt : (states[a].nextProbe || nowMs() + states[a].backoff * 1000);
+    const tb = states[b].resetAt > nowMs() ? states[b].resetAt : (states[b].nextProbe || nowMs() + states[b].backoff * 1000);
+    return ta - tb;
+  });
+  return states[rest[0]].name;
+}
+
 // 候选排序: 全部尝试顺序 (首个尝试尽量是钉住/最优, 后续为 failover 候选)
 async function buildCandidates(cfg, model, sticky) {
-  // 只探测真正要用的节点: 有钉住时只探测钉住的 proxy, 其余节点仅用缓存状态参与兜底,
-  // 避免每次请求对全部节点做 healthz 探测 (探测会消耗额度, 增加封号风险)。
+  // 探测策略 (PROBE_MODE):
+  //   smart (默认) —— 只探测"将要实际使用"的代理 (常驻 pin 或 LRU 首选), 其余节点仅用缓存,
+  //                   绝不浪费空闲代理额度。
+  //   scan         —— 无钉住选路时全量探测所有代理, 按余量选最优 (会消耗空闲代理额度)。
   let pinned = null;
   if (sticky) pinned = await getPin(sticky, cfg);
-  const states = await Promise.all(cfg.proxies.map(p => {
-    if (pinned && p.name !== pinned) return getState(p, cfg); // 仅缓存, 不探测
-    return ensureFresh(p, cfg, { model });
-  }));
-  // 维护模式: 排除维护中的 proxy (双通道: 独立 key + state.maint 标记)。
   const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url, cfg)));
   const usable = (s, i) => !maint[i] && !s.maint;
+
+  let states;
+  if (cfg.probeMode === 'scan' && !pinned) {
+    // 全量扫描: 探测所有代理以按余量选最优
+    states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, { model })));
+  } else {
+    // 智能探测 (默认): 只探测将要使用的代理
+    const cached = await Promise.all(cfg.proxies.map(p => getState(p, cfg)));
+    const prefer = pickPreferred(cached, usable, pinned);
+    states = await Promise.all(cached.map((s, i) => {
+      const p = cfg.proxies[i];
+      return (p.name === prefer) ? ensureFresh(p, cfg, { model }) : s;
+    }));
+  }
+
   const ok = states.filter((s, i) => usable(s, i) && s.status === 'ok');
   const unknown = states.filter((s, i) => usable(s, i) && s.status === 'unknown');
   const depleted = states.filter((s, i) => usable(s, i) && s.status === 'depleted');
@@ -991,7 +1040,7 @@ function extractModel(req, body) {
 
 async function handleModels(req, cfg) {
   const results = await Promise.allSettled(cfg.proxies.map(async p => {
-    const st = await ensureFresh(p, cfg, {});
+    const st = await getState(p, cfg); // 只读缓存状态, 不探测 (探测浪费空闲代理额度)
     const url = p.url + '/v1/models';
     // 与 doProbe 一致的上游超时: 挂死的 proxy 不能无限卡住 /v1/models 与后台模型下拉
     const ctrl = new AbortController();
@@ -1061,7 +1110,7 @@ async function flushRoutes(cfg) {
   let wrote = false;
   try {
     if (cfg.env) {
-      const ok = await controlAppend(cfg.env, 'routes', batch, MAX_ROUTES, 86400);
+      const ok = await controlAppend(cfg.env, 'routes', batch, MAX_ROUTES, cfg.logTtl);
       if (ok) { ROUTE_L1.splice(0, batch.length); wrote = true; }
     }
     if (!wrote) {
@@ -1072,7 +1121,7 @@ async function flushRoutes(cfg) {
       if (list.length > MAX_ROUTES) list = list.slice(list.length - MAX_ROUTES);
       await caches.default.put(ROUTES_KEY, new Response(JSON.stringify(list), {
         headers: { 'Content-Type': 'application/json' },
-      }), { ttl: 86400 });
+      }), { ttl: cfg.logTtl });
       ROUTE_L1.splice(0, batch.length);
       wrote = true;
     }
@@ -1118,7 +1167,7 @@ async function flushEvents(cfg) {
   let wrote = false;
   try {
     if (cfg.env) {
-      const ok = await controlAppend(cfg.env, 'events', batch, MAX_EVENTS, 86400);
+      const ok = await controlAppend(cfg.env, 'events', batch, MAX_EVENTS, cfg.logTtl);
       if (ok) { EVENT_L1.splice(0, batch.length); wrote = true; }
     }
     if (!wrote) {
@@ -1129,7 +1178,7 @@ async function flushEvents(cfg) {
       if (list.length > MAX_EVENTS) list = list.slice(list.length - MAX_EVENTS);
       await caches.default.put(EVENTS_KEY, new Response(JSON.stringify(list), {
         headers: { 'Content-Type': 'application/json' },
-      }), { ttl: 86400 });
+      }), { ttl: cfg.logTtl });
       EVENT_L1.splice(0, batch.length);
     }
   } catch (e) { /* 保留 batch, 稍后重试 */ }
@@ -1290,6 +1339,7 @@ async function applyRuntimeConfig(cfg) {
   const s = rc.settings;
   if (s && typeof s === 'object') {
     if (typeof s.pinMode === 'string' && ['client', 'header', 'off'].includes(s.pinMode)) cfg.pinMode = s.pinMode;
+    if (typeof s.probeMode === 'string' && ['smart', 'scan'].includes(s.probeMode)) cfg.probeMode = s.probeMode;
     if (Number.isFinite(s.pinTtl) && s.pinTtl >= 60) cfg.pinTtl = Math.floor(s.pinTtl);
     if (Number.isFinite(s.stateTtl) && s.stateTtl >= 60) cfg.stateTtl = Math.floor(s.stateTtl);
     if (Number.isFinite(s.depletedProbe) && s.depletedProbe >= 60) cfg.depletedProbe = Math.floor(s.depletedProbe);
@@ -1304,8 +1354,9 @@ async function applyRuntimeConfig(cfg) {
 // ─────────────────────────── 网关自身端点 ───────────────────────────
 
 async function handleGatewayHealth(cfg) {
-  // 触发所有过期项探测, 返回全景
-  const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, {})));
+  // 只读: 返回缓存/最近已知状态, 绝不触发探测。该端点是公开的, 常被 uptime 监控
+  // 高频轮询; 若在这里触发探测会无脑打爆所有空闲代理的额度 + 服务器资源。
+  const states = await Promise.all(cfg.proxies.map(p => getState(p, cfg)));
   const tokens = states.map(st => ({
     name: st.name,
     url: st.url,
@@ -1351,7 +1402,9 @@ function maskKey(k) {
 
 // 汇总 overview: 各 proxy 状态 + 统计 + 维护状态 + 事件
 async function adminOverview(cfg) {
-  const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, {})));
+  // 只读: 后台每 5s 轮询一次, 绝不能在轮询里触发探测 (否则等价于无脑探测风暴)。
+  // 需要刷新时用「立即探测」按钮手动触发。
+  const states = await Promise.all(cfg.proxies.map(p => getState(p, cfg)));
   const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url, cfg)));
   const proxies = states.map((st, i) => {
     const isMaint = !!maint[i] || !!st.maint;
@@ -1403,6 +1456,7 @@ async function adminConfig(cfg) {
       // 生效配置 (含运行时覆盖后的结果); proxies 带完整 apiKey (管理后台可见, 供编辑回填)
       proxies: cfg.proxies.map(p => ({ name: p.name, url: p.url, apiKey: p.apiKey })),
       pin_mode: cfg.pinMode,
+      probe_mode: cfg.probeMode,
       pin_ttl: cfg.pinTtl,
       state_ttl: cfg.stateTtl,
       depleted_probe: cfg.depletedProbe,
@@ -1458,6 +1512,7 @@ async function adminSaveConfig(req, cfg) {
     }
     const s = body.settings;
     if (s.pinMode !== undefined && !['client', 'header', 'off'].includes(s.pinMode)) return errorResponse(400, 'invalid_config', 'pinMode must be client|header|off', {});
+    if (s.probeMode !== undefined && !['smart', 'scan'].includes(s.probeMode)) return errorResponse(400, 'invalid_config', 'probeMode must be smart|scan', {});
     for (const [k, min] of [['pinTtl', 60], ['stateTtl', 60], ['depletedProbe', 60], ['downProbe', 30], ['probeTimeout', 500], ['chatTimeout', 1000]]) {
       if (s[k] !== undefined && (!Number.isFinite(s[k]) || s[k] < min)) return errorResponse(400, 'invalid_config', k + ' must be >= ' + min, {});
     }
@@ -1466,6 +1521,7 @@ async function adminSaveConfig(req, cfg) {
     // 否则一次只传 {pinMode} 的部分保存会静默丢掉之前保存的 maxAttempts 等其它参数。
     const merged = { ...((rc.settings && typeof rc.settings === 'object') ? rc.settings : {}) };
     if (s.pinMode !== undefined) merged.pinMode = s.pinMode;
+    if (s.probeMode !== undefined) merged.probeMode = s.probeMode;
     if (s.pinTtl !== undefined) merged.pinTtl = Math.floor(s.pinTtl);
     if (s.stateTtl !== undefined) merged.stateTtl = Math.floor(s.stateTtl);
     if (s.depletedProbe !== undefined) merged.depletedProbe = Math.floor(s.depletedProbe);
@@ -1508,6 +1564,24 @@ async function adminProbe(req, cfg) {
     return { name: p.name, status: st.status, detail: st.detail };
   }));
   return new Response(JSON.stringify({ results, total: results.length }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
+// 清空持久化日志 (路由记录 + 系统事件), 防止日志把 Durable Object / cache 打满
+async function adminClearLogs(cfg) {
+  try {
+    if (cfg.env) {
+      await controlDelete(cfg.env, 'routes');
+      await controlDelete(cfg.env, 'events');
+    }
+    await caches.default.delete(ROUTES_KEY);
+    await caches.default.delete(EVENTS_KEY);
+  } catch (e) { /* 尽力而为 */ }
+  ROUTE_L1.length = 0;
+  EVENT_L1.length = 0;
+  pushEvent(cfg, 'admin_action', { action: 'clear_logs' });
+  return new Response(JSON.stringify({ cleared: true, note: '路由记录与系统事件已清空' }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
   });
 }
@@ -1760,6 +1834,7 @@ export default {
         case 'POST /config': return adminSaveConfig(request, cfg);
         case 'POST /config/reset': return adminResetConfig(cfg);
         case 'POST /probe': return adminProbe(request, cfg);
+        case 'POST /logs/clear': return adminClearLogs(cfg);
         case 'POST /maintenance': return adminMaintenance(request, cfg);
         case 'POST /pin': return adminPin(request, cfg);
         case 'GET /pin': return adminPinStatus(request, cfg);

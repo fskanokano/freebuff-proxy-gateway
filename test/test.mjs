@@ -229,28 +229,33 @@ a.ctl.usagePct = 90; b.ctl.usagePct = 10; c.ctl.usagePct = 50;
 const env1 = envFor([a, b, c]);
 const [na, nb, nc] = proxyNames([a, b, c]);
 
-await t('S1 选路: 无钉住时选余量最多的 proxy', async () => {
+await t('S1 智能探测: 无钉住冷启动只探测首选代理, 不整池探测', async () => {
+  const aHits = a.ctl.healthzHits, bHits = b.ctl.healthzHits, cHits = c.ctl.healthzHits;
   const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false } }), env1, {});
   assert.equal(res.status, 200);
-  assert.equal(res.headers.get('x-gateway-proxy'), nb);
-  assert.equal(b.ctl.chatHits, 1);
+  assert.equal(res.headers.get('x-gateway-proxy'), na); // 冷启动 LRU 平局 → 第一个代理
+  assert.equal(a.ctl.chatHits, 1);
+  // 只探测了首选 a; b/c 是空闲代理, 绝不被白白探测
+  assert.equal(a.ctl.healthzHits, aHits + 1);
+  assert.equal(b.ctl.healthzHits, bHits);
+  assert.equal(c.ctl.healthzHits, cHits);
 });
 
-await t('S2 钉住: 同一客户端 key 第二次请求仍走同一 proxy', async () => {
+await t('S2 钉住: 同一客户端 key 第二次请求仍走常驻代理', async () => {
   a.ctl.usagePct = 0;
   const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false } }), env1, {});
   assert.equal(res.status, 200);
-  assert.equal(res.headers.get('x-gateway-proxy'), nb);
+  assert.equal(res.headers.get('x-gateway-proxy'), na);
 });
 
-await t('S3 钉住切换: 额度耗尽(429) → failover 到最优并重钉', async () => {
+await t('S3 钉住切换: 常驻代理额度耗尽(429) → failover 到下一代理并重钉', async () => {
   advance(61 * 1000);
-  b.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 120, body: 'upstream rate limited (reset at 2026-08-17T12:00:00Z)' };
+  a.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 120, body: 'upstream rate limited (reset at 2026-08-17T12:00:00Z)' };
   const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false } }), env1, {});
   assert.equal(res.status, 200);
-  assert.equal(res.headers.get('x-gateway-proxy'), na);
+  assert.equal(res.headers.get('x-gateway-proxy'), nb); // failover 到下一个 (b)
   assert.equal(res.headers.get('x-gateway-attempts'), '2');
-  const hz = await hzOf(env1, nb);
+  const hz = await hzOf(env1, na);
   assert.equal(hz.status, 'depleted');
   assert.equal(hz.reason, 'rate_limited');
 });
@@ -276,14 +281,18 @@ await t('S5 全 depleted → 429 + Retry-After', async () => {
   assert.ok(Number(res.headers.get('retry-after')) >= 60);
 });
 
-await t('S6 恢复探测: reset 时刻到达 → 探测恢复重新入池', async () => {
+await t('S6 恢复探测: 全部耗尽时 reset 到期的代理被懒探测重新入池', async () => {
   const x = await makeProxy('x2'); const y = await makeProxy('y2');
   const [nx] = proxyNames([x, y]);
-  const resetTime = new Date(Date.now() + 30 * 1000).toISOString();
-  x.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 30, body: 'upstream rate limited (reset at ' + resetTime + ')' };
-  y.ctl.usagePct = 30;
+  const resetX = new Date(Date.now() + 30 * 1000).toISOString();
+  const resetY = new Date(Date.now() + 3600 * 1000).toISOString();
+  x.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 30, body: 'upstream rate limited (reset at ' + resetX + ')' };
+  y.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 3600, body: 'upstream rate limited (reset at ' + resetY + ')' };
   const env6 = envFor([x, y], { API_KEY: 't1,t2,t3' });
-  await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false }, key: 't1' }), env6, {});
+  // 首次: x(首选) 与 y 都 429 → 全失败
+  const first = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false }, key: 't1' }), env6, {});
+  assert.equal(first.status, 429);
+  // reset 到期后 x 恢复, y 仍在耗尽; 全耗尽候选里选恢复最早的 x
   advance(60 * 1000);
   x.ctl.fail = null; x.ctl.usagePct = 5;
   const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false }, key: 't2' }), env6, {});
@@ -317,19 +326,21 @@ await t('S8 网关鉴权: 错 key 401, 无 key 401, /healthz 公开', async () =
   assert.equal(res3.status, 200);
 });
 
-await t('S9 /v1/models 聚合 + x-sticky-id header 钉住', async () => {
+await t('S9 /v1/models 聚合 + x-sticky-id header 钉住 (LRU 轮转)', async () => {
   const p1 = await makeProxy('m1'); const p2 = await makeProxy('m2');
   const [n1, n2] = proxyNames([p1, p2]);
   p1.ctl.usagePct = 80; p2.ctl.usagePct = 10;
   const env9 = envFor([p1, p2], { PIN_MODE: 'header' });
+  // conv-1 (无钉住): LRU 冷启动 → n1; 只探测 n1, 不探测空闲的 n2
   let res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'conv-1' } }), env9, {});
-  assert.equal(res.headers.get('x-gateway-proxy'), n2);
-  p2.ctl.usagePct = 99;
-  res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'conv-1' } }), env9, {});
-  assert.equal(res.headers.get('x-gateway-proxy'), n2);
-  advance(61 * 1000);
-  res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'conv-2' } }), env9, {});
   assert.equal(res.headers.get('x-gateway-proxy'), n1);
+  assert.equal(p2.ctl.healthzHits, 0);
+  // conv-1 再次: 命中常驻 n1
+  res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'conv-1' } }), env9, {});
+  assert.equal(res.headers.get('x-gateway-proxy'), n1);
+  // conv-2 (新会话): LRU 轮转到 n2 (n1 刚用过)
+  res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, headers: { 'X-Sticky-Id': 'conv-2' } }), env9, {});
+  assert.equal(res.headers.get('x-gateway-proxy'), n2);
   const mr = await worker.fetch(gwReq('/v1/models', { method: 'GET' }), env9, {});
   const mj = await mr.json();
   assert.ok(mj.data.some(m => m.id === 'freebuff-1'));
@@ -398,15 +409,16 @@ await t('S14 预判: 冷却中 (CooldownUntil 未来) → depleted(cooldown)', a
   assert.equal(p1.ctl.chatHits, 0);
 });
 
-await t('S15 多 key 一一对应 + 探测也带对应 key', async () => {
+await t('S15 多 key 一一对应 + 探测只对所选代理带对应 key', async () => {
   const p1 = await makeProxy('ka1'); const p2 = await makeProxy('ka2');
   p1.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 60, body: 'upstream rate limited' };
   const env15 = { PROXIES: p1.url + ',' + p2.url, GATEWAY_API_KEYS: 'keyA,keyB', API_KEY: 't15' };
   const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false }, key: 't15' }), env15, {});
   assert.equal(res.status, 200);
-  assert.equal(p1.ctl.lastAuth, 'keyA');
-  assert.equal(p2.ctl.lastAuth, 'keyB');
-  assert.equal(p2.ctl.healthzLastAuth, 'keyB');
+  assert.equal(p1.ctl.lastAuth, 'keyA');        // p1 被路由 (收到 429)
+  assert.equal(p1.ctl.healthzLastAuth, 'keyA'); // p1 被探测 (带对应 keyA)
+  assert.equal(p2.ctl.lastAuth, 'keyB');        // p2 兜底服务 (带对应 keyB)
+  assert.equal(p2.ctl.healthzHits, 0);          // p2 未被探测 (空闲代理不浪费探测)
 });
 
 await t('S16 单 key 广播', async () => {
@@ -925,16 +937,17 @@ await t('PR4 healthz 缺 tokens 数组 → 探测失败', async () => {
   assert.equal(hz.status, 'unknown');
 });
 
-await t('PR5 探测恢复: down 的 proxy healthz 转好 → 重新入池', async () => {
+await t('PR5 /healthz 只读: 不触发探测; 探测经路由触发后状态落盘', async () => {
   const p1 = await makeProxy('p5a'); const p2 = await makeProxy('p5b');
   const [n1] = proxyNames([p1, p2]);
-  p1.ctl.healthzStatus = 500;
   const env = envFor([p1, p2], { API_KEY: 't-p5', DOWN_PROBE_SECONDS: '60' });
+  // /healthz 只读: 未探测时返回 unknown, 且不发起任何探测 (uptime 高频轮询也不烧额度)
   let hz = await hzOf(env, n1);
   assert.equal(hz.status, 'unknown');
-  // healthz 恢复
-  advance(65e3);
-  p1.ctl.healthzStatus = 200; p1.ctl.usagePct = 5;
+  assert.equal(p1.ctl.healthzHits, 0);
+  // 通过一次真实路由探测 n1 (首选), 状态落盘后 /healthz 可见 ok
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-p5' }), env, {});
+  assert.equal(res.status, 200);
   hz = await hzOf(env, n1);
   assert.equal(hz.status, 'ok');
 });
@@ -1079,21 +1092,24 @@ await t('ST4 同名不同 URL 的 proxy 状态隔离 (L1 + cache key 含 url 哈
 
 console.log('\n== 管理后台 ==');
 
-await t('ADM1 overview: 返回完整代理状态与统计', async () => {
+await t('ADM1 overview: 返回完整代理状态与统计 (只读, 不触发探测)', async () => {
   const p1 = await makeProxy('ad1a'); const p2 = await makeProxy('ad1b');
-  const [n1] = proxyNames([p1, p2]);
-  p1.ctl.usagePct = 40; p2.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 60, body: 'x' };
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.usagePct = 40; p1.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 60, body: 'x' };
   const env = envFor([p1, p2], { API_KEY: 't-ad1' });
+  const p2Hits = p2.ctl.healthzHits;
   await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-ad1' }), env, {});
   const r = await worker.fetch(new Request('https://gw.example/admin/api/overview', { headers: { Authorization: 'Bearer t-ad1' } }), env, {});
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.stats.total, 2);
   assert.equal(j.proxies.length, 2);
-  const h = j.proxies.find(p => p.name === n1);
-  assert.equal(h.requestsOk, 1);
-  assert.equal(h.requestsFail, 0);
-  assert.ok(j.proxies.some(p => p.status === 'depleted'));
+  assert.ok(j.proxies.some(p => p.status === 'depleted')); // p1 耗尽
+  const hp2 = j.proxies.find(p => p.name === n2);
+  assert.equal(hp2.requestsOk, 1);
+  assert.equal(hp2.requestsFail, 0);
+  // overview 只读: 不会额外探测空闲的 p2
+  assert.equal(p2.ctl.healthzHits, p2Hits);
 });
 
 await t('ADM2 config: 掩码字段不泄露完整 key; proxies.apiKey 管理可见供编辑', async () => {
@@ -1379,6 +1395,8 @@ await t('HZ1 /healthz 透传 daily_limit / messages_24h (探测解析字段落�
   const p = await makeProxy('hz1');
   p.ctl.usagePct = 30; // mock healthz: Messages24h=6, DailyLimit=20
   const env = envFor([p], { API_KEY: 't-hz1' });
+  // 触发一次真实路由 (探测), 让 healthz 解析字段落盘; /healthz 本身只读
+  await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-hz1' }), env, {});
   const hz = await hzOf(env, proxyNames([p])[0]);
   // BUG-A: parseHealthz 解析了 DailyLimit/Messages24h, 但 applyHealthz 从不写回 state
   // → /healthz 的 daily_limit/messages_24h 永远 null。修复后必须透传。
@@ -1430,9 +1448,9 @@ await t('FO17 客户端中途断开 → 不把健康 proxy 标 down (abort 先�
   const p = await makeProxy('f17');
   const [n1] = proxyNames([p]);
   const env = envFor([p], { API_KEY: 't-f17' });
-  // 先确认 proxy 健康
-  let hz = await hzOf(env, n1);
-  assert.equal(hz.status, 'ok');
+  // 先发一次正常请求建立 ok 状态 (探测经路由触发; /healthz 现在只读)
+  const res0 = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-f17' }), env, {});
+  assert.equal(res0.status, 200);
   // proxy 响应延迟 5s (上游 fetch 在途), 客户端在响应前断开
   p.ctl.chatDelay = 5000;
   const ctrl = new AbortController();
@@ -1450,7 +1468,7 @@ await t('FO17 客户端中途断开 → 不把健康 proxy 标 down (abort 先�
   const j = await res.json();
   assert.equal(j.error.code, 'client_closed');
   // BUG: 旧代码先 recordFailure(down) 再判 abort → 健康 proxy 被踢出选路池 120s+
-  hz = await hzOf(env, n1);
+  const hz = await hzOf(env, n1);
   assert.equal(hz.status, 'ok');
 });
 
@@ -1572,8 +1590,14 @@ await t('RUN1 保存代理列表 → 立即生效, 路由用新代理 + 各自�
   assert.equal(cfg.config.runtime_managed, true);
   assert.equal(cfg.config.has_runtime_config, true);
   assert.equal(cfg.config.proxies.length, 2);
-  // 路由到新列表中的最优 (rb, usage 0), 且用运行时保存的 apiKey 调下游
-  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-run1' }), env, {});
+  // 路由用新列表: 冷启动 LRU → ra (首个), 用运行时保存的 apiKey kA
+  let res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-run1' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), 'ra');
+  assert.equal(pa.ctl.lastAuth, 'kA');
+  // ra 耗尽 → failover 到 rb, 用 kB (验证新代理也被纳入选路)
+  pa.ctl.fail = { status: 429, code: 'rate_limited', retryAfter: 60, body: 'x' };
+  res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-run1' }), env, {});
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('x-gateway-proxy'), 'rb');
   assert.equal(pb.ctl.lastAuth, 'kB');
@@ -1685,6 +1709,92 @@ await t('RUN7 运行时配置脏数据降级: 非法 proxies → 回退环境变
   assert.equal(res.status, 200);
   // 清理, 避免污染后续
   await worker.fetch(new Request('https://gw.example/admin/api/config/reset', { method: 'POST', headers: { Authorization: 'Bearer t-run7', 'Content-Type': 'application/json' }, body: '{}' }), env, {});
+});
+
+console.log('\n== 探测策略开关 (PROBE_MODE) ==');
+
+await t('PM1 PROBE_MODE=scan: 无钉住全量探测并按余量选最优', async () => {
+  const a = await makeProxy('pm1a'); const b = await makeProxy('pm1b'); const c = await makeProxy('pm1c');
+  const [na, nb] = proxyNames([a, b, c]);
+  a.ctl.usagePct = 90; b.ctl.usagePct = 10; c.ctl.usagePct = 50;
+  const env = envFor([a, b, c], { API_KEY: 't-pm1', PROBE_MODE: 'scan' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false }, key: 't-pm1' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), nb); // b (usage 10) 余量最多
+  assert.ok(a.ctl.healthzHits >= 1 && b.ctl.healthzHits >= 1 && c.ctl.healthzHits >= 1, 'scan 模式应全量探测');
+});
+
+await t('PM2 PROBE_MODE 默认(smart): 无钉住只探测首选, 空闲代理不被探测', async () => {
+  const a = await makeProxy('pm2a'); const b = await makeProxy('pm2b');
+  const [na] = proxyNames([a, b]);
+  a.ctl.usagePct = 90; b.ctl.usagePct = 10;
+  const env = envFor([a, b], { API_KEY: 't-pm2' }); // 未设 PROBE_MODE → smart (默认关闭全量扫描)
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [], stream: false }, key: 't-pm2' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), na); // LRU 冷启动 → 第一个
+  assert.equal(a.ctl.healthzHits, 1); // 只探测 a
+  assert.equal(b.ctl.healthzHits, 0); // 空闲 b 不被探测
+});
+
+console.log('\n== Durable Object 定时清理 (防日志打满) ==');
+
+// 模拟 DO storage (Map 后备 + alarm 时间戳)
+function makeMockStorage() {
+  const m = new Map();
+  let alarmAt = null;
+  return {
+    getAlarmAt: () => alarmAt,
+    async get(key) { return m.get(key); },
+    async put(key, value) { m.set(key, value); },
+    async delete(key) { m.delete(key); },
+    async list() { return new Map(m); },
+    async getAlarm() { return alarmAt; },
+    async setAlarm(ts) { alarmAt = ts; },
+    _m: m,
+  };
+}
+
+await t('DO1 gc 删除过期 key, 保留未过期 key', async () => {
+  const { GatewayControl } = await import(new URL('../control.js', import.meta.url).href);
+  const storage = makeMockStorage();
+  const ctl = new GatewayControl({ storage }, {});
+  await storage.put('expired', { value: 1, expiresAt: Date.now() - 1000 });
+  await storage.put('live', { value: 2, expiresAt: Date.now() + 3600e3 });
+  const removed = await ctl.gc();
+  assert.equal(removed, 1);
+  assert.equal(await storage.get('expired'), undefined);
+  assert.equal((await storage.get('live')).value, 2);
+});
+
+await t('DO2 写操作自动排期 alarm (定时清理)', async () => {
+  const { GatewayControl } = await import(new URL('../control.js', import.meta.url).href);
+  const storage = makeMockStorage();
+  const ctl = new GatewayControl({ storage }, {});
+  const r = await ctl.fetch(new Request('https://control/put?key=k', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: 'v', ttl: 60 }) }));
+  assert.equal(r.status, 200);
+  assert.ok(storage.getAlarmAt() > Date.now(), 'alarm should be scheduled after a write');
+});
+
+await t('DO3 alarm() 执行 GC 并重新排期', async () => {
+  const { GatewayControl } = await import(new URL('../control.js', import.meta.url).href);
+  const storage = makeMockStorage();
+  const ctl = new GatewayControl({ storage }, {});
+  await storage.put('gone', { value: 1, expiresAt: Date.now() - 1 });
+  await ctl.alarm();
+  assert.equal(await storage.get('gone'), undefined, 'alarm should GC expired keys');
+  assert.ok(storage.getAlarmAt() > Date.now(), 'alarm should re-arm after firing');
+});
+
+await t('DO4 /gc 端点手动触发清理', async () => {
+  const { GatewayControl } = await import(new URL('../control.js', import.meta.url).href);
+  const storage = makeMockStorage();
+  const ctl = new GatewayControl({ storage }, {});
+  await storage.put('old', { value: 1, expiresAt: Date.now() - 1 });
+  const r = await ctl.fetch(new Request('https://control/gc', { method: 'POST' }));
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.ok, true);
+  assert.equal(j.removed, 1);
 });
 
 // 收尾

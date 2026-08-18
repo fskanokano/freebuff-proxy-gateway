@@ -5,7 +5,7 @@
 - **按剩余额度选路** —— 读取各 proxy 的 `/healthz`（每日用量百分比 + 每模型会话额度 `recent/limit`），选余量最多的 proxy
 - **钉住路由 (sticky pin)** —— 同一客户端（或 `X-Sticky-Id` 会话）持续路由到当前 proxy，直到它额度耗尽，避免一个对话烧多个账号的额度
 - **带内失败切换** —— 收到 `429 rate_limited` / `402 out_of_credits` / `403 banned` / 5xx / 网络错误时，标记该 proxy 状态并**重放请求**切换到下一个 proxy
-- **智能恢复探测** —— 对 depleted/down 的 proxy 按退避（60→300s）或在 `resetAt + 10s` 时刻懒探测 `/healthz`，恢复即重新入池
+- **智能探测** —— 只在用户活跃使用、且仅对「当前常驻 / 即将使用的代理」探测 `/healthz`；空闲代理绝不探测（不白白消耗其额度）。depleted/down 仅在真正被使用或全耗尽时才懒探测恢复。如需无钉住时全量探测按余量选最优，可设 `PROBE_MODE=scan`（默认 `smart`）
 
 零依赖，免费计划可用。状态存 `caches.default`（跨 isolate 共享，最终一致——钉住偶尔过期只会导致一次请求换 proxy，自愈）。
 
@@ -21,7 +21,7 @@
                      │  · 状态: caches.default + L1          │
                      └──────┬──────────────┬───────────────┘
                     probe /healthz   POST /v1/chat/completions
-                     (60s 刷新)        (Bearer <proxy-key>)
+                     (按需探测, 仅常驻/所用代理)        (Bearer <proxy-key>)
               ┌──────────┴────┐   ┌────┴─────────┐   ┌────┴─────────┐
               │ proxy #1      │   │ proxy #2     │   │ proxy #N     │
               │ AUTH_TOKENS=t1│   │ AUTH_TOKENS=t2│   │ AUTH_TOKENS=tN│
@@ -60,6 +60,7 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 | `GATEWAY_API_KEYS` | ✅ | 网关调用下游 proxy 的 key，英文逗号分隔。**只配 1 个** → 所有下游共用；**配 N 个** → 按顺序一一对应 N 个下游 |
 | `API_KEY` | ✅ | **网关自身鉴权 key**，客户端调用网关时用 `Authorization: Bearer <API_KEY>`（可逗号分隔配多个）。不配则网关拒绝启动，防他人盗用 |
 | `PIN_MODE` | | `client`（默认，按客户端 key 钉住）\| `header`（按 `X-Sticky-Id`）\| `off` |
+| `PROBE_MODE` | | `smart`（默认，只探测常驻/将用代理，不浪费空闲代理额度）\| `scan`（无钉住选路时全量探测按余量选最优，会消耗空闲代理额度） |
 | `PIN_TTL_SECONDS` | | 钉住有效期，默认 `3600`（每次成功请求刷新） |
 | `STATE_TTL_SECONDS` | | ok 状态 `/healthz` 刷新间隔，默认 `60`（下限 60） |
 | `DEPLETED_PROBE_SECONDS` | | depleted 探测最大退避，默认 `300` |
@@ -68,6 +69,7 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 | `CHAT_TIMEOUT_MS` | | 非流式 chat **单次尝试**超时，默认 `120000`（2 分钟，下限 1000）。仅对非流式请求生效：上游挂死（连接建立但不响应）时网关主动中止该次尝试并 failover 到下一 proxy，而不是让请求挂到客户端超时。**流式请求不受此限制**（流一旦开始由客户端断开兜底） |
 | `MAX_ATTEMPTS` | | 单请求最大尝试 proxy 数，默认 `3` |
 | `LOG_LEVEL` | | `info`（默认）\| `debug` |
+| `LOG_TTL_SECONDS` | | 路由/事件日志持久化 TTL（秒），默认 `3600`。配合 Durable Object 的 alarm 定时清理，防止日志打满存储 |
 
 **最简示例**（单 proxy，最常见）：
 
@@ -113,7 +115,7 @@ npx wrangler dev
    - `API_KEY`（Secret）：客户端调网关的 key
 4. **添加后必须点一次 "Deploy"（或推送一次代码触发 Git 自动部署），变量才会进入运行版本**——否则会报 `PROXIES missing: ... config_error`（此时错误响应里的 `received_env_keys` 字段会显示运行时实际收到了哪些变量，可用于排查）
 
-> 零绑定：不依赖 KV / Durable Objects / 任何 binding，免费计划直接可用。`wrangler.jsonc` 中的可选 vars 已在导入时预填默认值。
+> 部署形态：核心路由零依赖 `caches.default`；可选启用 `GATEWAY_CONTROL` Durable Object（`wrangler.jsonc` 已带 binding + migration）承载强一致的钉住/维护/运行时配置/日志，并内置 alarm 定时清理过期 key 防止打满。不配 binding 时自动回退到 `caches.default`（最终一致）。
 
 > **配置了仍报 config_error？** 按顺序检查：① 变量类型是否选的是 **Secret**（文本变量会被每次部署清除——secrets 不会被清除）；② 是否配在 **Settings → Variables and Secrets**（不是 Build settings）；③ 添加后是否触发了新的 Deploy；④ 变量名是否与文档完全一致（`PROXIES` 全大写）；⑤ 是否配在了正确的 Worker/账户下。请求任意路径，网关的错误响应会列出 `received_env_keys`，一眼看出哪些变量进了运行时。
 
@@ -184,7 +186,7 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 - 请求体会被网关缓冲（≤32MB，json/text 类型）以支持 failover 重放；其余类型（multipart/octet-stream/ndjson 等）原样透传请求体流，但**不可重放**——首次尝试失败后不 failover，直接返回该次结果。透传分支不做缓冲，超限防护改为 **content-length 预检**（声明 >32MB 直接 413）；无长度（chunked）的流只能依赖边缘/上游限制
 - 非流式 chat 有单次尝试超时（`CHAT_TIMEOUT_MS`）；流式响应不做网关侧超时，挂起的流由客户端断开兜底（客户端取消会中止上游请求并返回 499，且不会把健康 proxy 误标 down）
 - 单 proxy 配了多个 token 也能用（healthz 只取 `tokens[0]`）——但建议按"1 proxy = 1 token"部署以让网关的额度视图精确
-- 网关自身无持久化；`/v1/models` 每次聚合各 proxy 实况
+- 路由/事件日志持久化到 `GATEWAY_CONTROL`（无 binding 时回退 `caches.default`），TTL 默认 1h 且 DO 每小时 alarm 清理过期 key，防止日志打满 DO；`/v1/models` 每次聚合各 proxy 实况（只读缓存状态，不触发探测）
 
 ## 测试
 
@@ -192,4 +194,4 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 node test/test.mjs
 ```
 
-113 个场景覆盖：核心路由(选路/钉住/failover/恢复/流式) + 配置解析极端(非法URL/重复/数量不匹配/缺必填) + 鉴权极端(大小写/空白/ADMIN_KEY隔离) + 路由极端(单proxy/全down/全网络错/LRU/维护模式/pin失效) + failover极端(429时间信息三态/403矩阵/401/404/重试上限/聚合优先级/流式中断/退避封顶) + 探测极端(healthz 500/超时/畸形/单飞/恢复/未恢复) + 请求体极端(空体/非法JSON/33MB/流式兼容/非JSON透传/透传超限413) + 状态缓存极端(写失败/时钟回拨/TTL边界/同名隔离) + 管理后台(overview/脱敏/probe/maintenance/pin/smoke/事件日志) + 隐藏 bug 回归(日额度透传/零值时间/HTTP-date Retry-After/客户端中断/非流式chat超时/运行时配置合并与去重/参数合并/脏数据降级/smoke 钉住污染/models 超时)。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 caches.default 与假时钟。FO13 退避断言已固定 jitter（消除 cache TTL 与新鲜窗口的竞态抖动，suite 稳定可作绿门）。测试历史上还抓到并修复过真实 bug：surface 误标 down、维护标记残留、updatedAt 续期阻止重探测、异常状态保活窗口不足。
+119 个场景覆盖：核心路由(智能探测选路/钉住/failover/恢复/流式) + 配置解析极端(非法URL/重复/数量不匹配/缺必填) + 鉴权极端(大小写/空白/ADMIN_KEY隔离) + 路由极端(单proxy/全down/全网络错/LRU/维护模式/pin失效) + failover极端(429时间信息三态/403矩阵/401/404/重试上限/聚合优先级/流式中断/退避封顶) + 探测极端(healthz 500/超时/畸形/单飞/恢复/未恢复) + 请求体极端(空体/非法JSON/33MB/流式兼容/非JSON透传/透传超限413) + 状态缓存极端(写失败/时钟回拨/TTL边界/同名隔离) + 管理后台(overview/脱敏/probe/maintenance/pin/smoke/事件日志) + 隐藏 bug 回归(日额度透传/零值时间/HTTP-date Retry-After/客户端中断/非流式chat超时/运行时配置合并与去重/参数合并/脏数据降级/smoke 钉住污染/models 超时) + 探测策略开关(PROBE_MODE smart/scan) + Durable Object 定时清理(gc/alarm/手动 /gc)。mock proxies 是本地 HTTP 服务，运行时 shim 模拟 caches.default 与假时钟。FO13 退避断言已固定 jitter（消除 cache TTL 与新鲜窗口的竞态抖动，suite 稳定可作绿门）。测试历史上还抓到并修复过真实 bug：surface 误标 down、维护标记残留、updatedAt 续期阻止重探测、异常状态保活窗口不足。

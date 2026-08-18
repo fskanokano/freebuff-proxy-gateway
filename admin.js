@@ -156,6 +156,33 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .event-desc{font-size:12px;color:var(--text2);word-break:break-all;margin-top:1px}
 .event-time{font-size:11px;color:var(--text3);margin-top:2px}
 .empty{padding:32px 16px;text-align:center;color:var(--text3);font-size:14px}
+/* ── 日志页 (redesigned) ── */
+.log-toolbar{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}
+.log-filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.log-filters .input{width:auto;min-width:120px;padding:8px 12px;font-size:13px;min-height:0;border-radius:10px}
+.log-actions{display:flex;gap:8px;align-items:center}
+.log-actions .btn{width:auto;min-height:34px;padding:7px 13px;font-size:13px;border-radius:10px}
+.log-live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text3);margin-left:auto;font-weight:500}
+.log-live .dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:logpulse 1.6s ease infinite}
+.log-live.paused .dot{background:var(--text3);animation:none}
+@keyframes logpulse{0%,100%{opacity:1}50%{opacity:.35}}
+.log-item{display:flex;gap:12px;padding:12px 16px;border-top:0.5px solid var(--sep);align-items:flex-start}
+.log-item:first-child{border-top:none}
+.log-item .li-ico{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px;font-weight:700}
+.log-item .li-ico.route-ok{background:rgba(52,199,89,.14);color:var(--green)}
+.log-item .li-ico.route-fail{background:rgba(255,59,48,.14);color:var(--red)}
+.log-item .li-ico.status_change{background:rgba(0,122,255,.14);color:var(--blue)}
+.log-item .li-ico.failover{background:rgba(255,149,0,.16);color:var(--orange)}
+.log-item .li-ico.probe_failed{background:rgba(255,59,48,.14);color:var(--red)}
+.log-item .li-ico.maintenance{background:rgba(175,82,222,.15);color:var(--purple)}
+.log-item .li-ico.admin_action{background:rgba(120,120,128,.18);color:var(--text2)}
+.log-item .li-ico.smoke{background:rgba(52,199,89,.14);color:var(--green)}
+.log-item .li-main{flex:1;min-width:0}
+.log-item .li-title{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.log-item .li-desc{font-size:12px;color:var(--text2);word-break:break-all;margin-top:2px;line-height:1.5}
+.log-item .li-time{font-size:11px;color:var(--text3);margin-top:3px}
+.log-chip{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--fill);color:var(--text2)}
+@media (max-width:767px){.log-item{padding:12px 14px}.log-actions .btn{flex:1}.log-filters .input{min-width:0;flex:1}}
 /* ── 表单 ── */
 .field{margin-bottom:12px}
 .field label{display:block;font-size:13px;color:var(--text2);margin-bottom:6px;font-weight:500}
@@ -242,31 +269,33 @@ button:active,.btn:active,.icon-btn:active,.side-item:active,.tab:active{transfo
   #sSave,#sReset{min-height:46px}.field{margin-bottom:14px}
   .toast{bottom:calc(72px + env(safe-area-inset-bottom));font-size:13px}
 }
-/* ── Desktop: operations console ── */
+/* ── Desktop: compact admin console ── */
 @media (min-width:1024px){
   :root{--canvas:#f5f7fb;--surface:#fff;--surface-soft:#f8fafc;--line:#e4e7ec}
   body{font-family:Inter,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;background:var(--canvas)}
-  .app{max-width:1440px;background:var(--canvas)}
-  .nav{height:70px;padding:0 32px;background:#fff;border-bottom:1px solid var(--line);backdrop-filter:none}
-  .nav-title{font-size:18px;color:#101828}.nav-dot{box-shadow:0 0 0 4px #ecfdf3}
-  .nav-actions{gap:8px}.icon-btn{width:38px;height:38px;background:#f2f4f7;color:#344054}
-  .layout{min-height:0}.sidebar{display:flex;width:246px;padding:20px 14px;background:#101828;border-right:0;color:#d0d5dd}
-  .sidebar:before{content:"CONTROL CENTER";display:block;color:#98a2b3;font-size:10px;letter-spacing:.13em;font-weight:700;padding:0 12px 12px}
-  .side-item{color:#98a2b3;padding:12px 13px;border-radius:10px;font-size:14px;margin-bottom:4px}
-  .side-item:hover{background:rgba(255,255,255,.08);color:#fff}.side-item.active{background:#1d4ed8;color:#fff;box-shadow:0 5px 14px rgba(37,99,235,.22)}
-  .content{padding:32px 38px 46px;max-width:1180px;margin:0 auto;width:100%}
-  h2.section{font-size:30px;line-height:1.08;letter-spacing:-.045em;margin:0 0 18px;color:#101828}
-  .sub{font-size:13px;color:#667085;margin:-10px 0 18px}.card,.proxy,.stat,.pin-banner{border:1px solid var(--line);box-shadow:0 1px 3px rgba(16,24,40,.035),0 8px 20px rgba(16,24,40,.035);border-radius:16px}
-  .card:hover,.proxy:hover{box-shadow:0 3px 8px rgba(16,24,40,.06),0 14px 28px rgba(16,24,40,.045)}
-  .stats{gap:12px;margin-bottom:16px}.stat{padding:18px 19px}.stat-num{font-size:30px}.stat-label{font-size:12px;color:#667085}
-  #view-overview.active{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(340px,.85fr);gap:16px;align-items:start}
+  .app{max-width:100%;background:var(--canvas)}
+  .nav{height:56px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--line);backdrop-filter:none}
+  .nav-title{font-size:16px;font-weight:600;color:#101828}.nav-dot{box-shadow:none}
+  .nav-actions{gap:6px}.icon-btn{width:34px;height:34px;background:#f2f4f7;color:#344054;font-size:15px}
+  .layout{min-height:0}
+  .sidebar{display:flex;flex-direction:column;width:220px;padding:14px 12px;background:var(--surface);border-right:1px solid var(--line);color:var(--text2)}
+  .side-item{color:var(--text2);padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:2px}
+  .side-item:hover{background:var(--fill);color:var(--text)}
+  .side-item.active{background:var(--accent-soft);color:var(--accent)}
+  .content{padding:22px 26px 48px;width:100%}
+  h2.section{font-size:24px;line-height:1.12;letter-spacing:-.03em;margin:0 0 14px;color:#101828}
+  .sub{font-size:13px;color:#667085;margin:-6px 0 16px}
+  .card,.proxy,.stat,.pin-banner{border:1px solid var(--line);box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 12px rgba(16,24,40,.03);border-radius:14px}
+  .card:hover,.proxy:hover{box-shadow:0 2px 6px rgba(16,24,40,.06),0 8px 18px rgba(16,24,40,.045)}
+  .stats{gap:10px;margin-bottom:14px}.stat{padding:16px 18px}.stat-num{font-size:26px}.stat-label{font-size:12px;color:#667085}
+  #view-overview.active{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
   #view-overview.active>h2,#view-overview.active>.stats{grid-column:1/-1}
-  #view-overview.active>.card{margin:0}.card-head{padding:16px 18px 11px}.card-body{padding:3px 18px 18px}
+  #view-overview.active>.card{margin:0}.card-head{padding:14px 16px 10px}.card-body{padding:3px 16px 16px}
   .proxy-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.proxy-cards .proxy{margin:0}
-  .proxy-head{padding:16px 18px 0}.proxy-actions{gap:6px}.proxy-actions .icon-btn{width:34px;height:34px}.proxy-grid{gap:2px 24px}
-  .pin-banner{grid-column:1/-1;padding:15px 18px;margin-bottom:0}.btn{width:auto;min-height:42px;padding:10px 20px}.input{min-height:44px}
-  #view-events.active{max-width:980px;margin:0 auto}.event{padding:13px 18px}.event-title{font-size:14px}.event-desc{font-size:12px}
-  #view-test.active{max-width:720px;margin:0 auto}.result{font-size:13px;line-height:1.65}
+  .proxy-head{padding:15px 16px 0}.proxy-actions{gap:6px}.proxy-actions .icon-btn{width:32px;height:32px}.proxy-grid{gap:2px 20px}
+  .pin-banner{grid-column:1/-1;padding:14px 16px;margin-bottom:0}.btn{width:auto;min-height:40px;padding:9px 18px}.input{min-height:42px}
+  #view-events.active{max-width:none;margin:0}.event{padding:12px 16px}.event-title{font-size:14px}.event-desc{font-size:12px}
+  #view-test.active{max-width:none;margin:0}.result{font-size:13px;line-height:1.65}
   #view-settings.active{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:start}
   #view-settings.active>h2,#view-settings.active>.sub{grid-column:1/-1;margin-bottom:0}.field{margin-bottom:14px}
   .login{background:rgba(16,24,40,.45)}.login-card{border:1px solid rgba(255,255,255,.4)}
@@ -326,7 +355,7 @@ body.theme-dark .pin-banner .pin-sub{color:rgba(235,235,245,.56)}
 @media (min-width:1024px){
   body.theme-dark{--canvas:#000;--surface:#1c1c1e;--surface-soft:#2c2c2e;--line:#38383a}
   body.theme-dark .nav{background:#1c1c1e;border-bottom-color:#38383a}
-  body.theme-dark .sidebar{background:#0b0b0d}
+  body.theme-dark .sidebar{background:#1c1c1e;border-right-color:#38383a}
   body.theme-dark .content{background:#000}
 }
 
@@ -377,7 +406,7 @@ body.theme-dark .pin-banner .pin-sub{color:rgba(235,235,245,.56)}
 <div class="toast" id="toast"></div>
 <script>
 "use strict";
-var state={key:localStorage.getItem("gwkey")||"",view:localStorage.getItem("gwview")||"overview",theme:localStorage.getItem("gwtheme")||"auto",timer:null};
+var state={key:localStorage.getItem("gwkey")||"",view:localStorage.getItem("gwview")||"overview",theme:localStorage.getItem("gwtheme")||"auto",timer:null,logFilter:localStorage.getItem("gwlogfilter")||"all",logProxy:"all",logStatus:"all",logLive:true};
 var ICONS={
   overview:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>',
   proxies:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 0 1 10 10M2 12a10 10 0 0 1 10-10M12 22a10 10 0 0 1-10-10M22 12a10 10 0 0 1-10 10"/></svg>',
@@ -387,6 +416,8 @@ var ICONS={
 };
 var TABS=[["overview","总览"],["proxies","代理"],["events","日志"],["test","测试"],["settings","设置"]];
 var LABELS={ok:"正常",depleted:"额度耗尽",down:"不可用",unknown:"未知",bad_config:"配置错误",maint:"维护中"};
+var EVT_META={status_change:{label:"状态变更",ico:"\u25CF"},failover:{label:"故障切换",ico:"\u21C4"},probe_failed:{label:"探测失败",ico:"\u26A0"},maintenance:{label:"维护模式",ico:"\u25D0"},admin_action:{label:"管理操作",ico:"\u2699"},smoke:{label:"冒烟测试",ico:"\u2713"}};
+var ACTION_LABELS={probe:"立即探测",save_config:"保存配置",reset_config:"恢复环境变量",clear_pin:"解除常驻",clear_logs:"清空日志"};
 function $(s){return document.querySelector(s)}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function toast(msg){var t=$("#toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove("show")},2200)}
@@ -613,58 +644,142 @@ function renderPinBanner(pd){
   el.innerHTML='<div class="pin-banner"><div><div>当前会话 <b>未常驻</b>, 暂无路由记录</div>'+
     '<div class="pin-sub">PIN_MODE='+esc(modeTxt)+' · 客户端发起成功请求后会自动钉住所选代理</div></div></div>';
 }
-/* ── 渲染: 日志 (路由记录 + 系统事件, 可筛选) ── */
+/* ── 渲染: 日志 (路由记录 + 系统事件, 可筛选/暂停/清空) ── */
+var _evToolbarBuilt=false,_evProxiesSig="",_evListSig="";
 function renderEvents(d){
   var el=$("#view-events");
-  el.innerHTML='<h2 class="section">日志</h2><div class="sub">每次请求的路由记录 (最近 200 条) 与系统事件</div>'+
-    '<div class="seg" id="evFilter">'+
-    '<button data-f="all" class="active">全部</button>'+
-    '<button data-f="route">路由记录</button>'+
-    '<button data-f="system">系统事件</button></div>'+
-    '<div id="evList"></div>';
+  var proxyNames=(d.proxies||[]).map(function(p){return p.name}).sort().join(",");
+  // 工具栏只在代理列表变化时重建; 轮询重绘只更新列表, 保留筛选与滚动位置
+  if(!_evToolbarBuilt||proxyNames!==_evProxiesSig){
+    _evToolbarBuilt=true;_evProxiesSig=proxyNames;
+    var opts='<option value="all">全部代理</option>';
+    (d.proxies||[]).forEach(function(p){opts+='<option value="'+esc(p.name)+'">'+esc(p.name)+"</option>"});
+    el.innerHTML='<h2 class="section">日志</h2>'+
+      '<div class="sub">路由记录 + 系统事件 (最近 200 条 · 每 1 小时自动清理持久化日志)</div>'+
+      '<div class="log-toolbar">'+
+        '<div class="seg" id="evFilter">'+
+          '<button data-f="all" class="active">全部</button>'+
+          '<button data-f="route">路由记录</button>'+
+          '<button data-f="system">系统事件</button></div>'+
+        '<div class="log-filters">'+
+          '<select class="input" id="evProxy">'+opts+'</select>'+
+          '<select class="input" id="evStatus">'+
+            '<option value="all">全部状态</option>'+
+            '<option value="ok">成功</option>'+
+            '<option value="fail">失败</option></select>'+
+          '<span class="log-live'+(state.logLive?"":" paused")+'" id="evLiveInd"><span class="dot"></span><span>'+(state.logLive?"自动刷新中":"已暂停")+"</span></span>"+
+        "</div>"+
+        '<div class="log-actions">'+
+          '<button class="btn secondary" id="evLiveBtn">'+(state.logLive?"暂停刷新":"继续刷新")+"</button>"+
+          '<button class="btn danger" id="evClearBtn">清空日志</button>'+
+        "</div>"+
+      "</div>"+
+      '<div id="evList"></div>';
+    bindEventToolbar(el,d);
+  }
+  renderEventList(d);
+}
+function bindEventToolbar(el,d){
+  var proxySel=$("#evProxy"),statusSel=$("#evStatus");
+  if(proxySel){proxySel.value=state.logProxy||"all";proxySel.onchange=function(){state.logProxy=proxySel.value;_evListSig="";renderEventList(d)}};
+  if(statusSel){statusSel.value=state.logStatus||"all";statusSel.onchange=function(){state.logStatus=statusSel.value;_evListSig="";renderEventList(d)}};
   el.querySelectorAll("#evFilter button").forEach(function(b){
+    if(b.dataset.f===(state.logFilter||"all"))b.classList.add("active");else b.classList.remove("active");
     b.onclick=function(){
+      state.logFilter=b.dataset.f;
+      localStorage.setItem("gwlogfilter",b.dataset.f);
       el.querySelectorAll("#evFilter button").forEach(function(x){x.classList.remove("active")});
       b.classList.add("active");
-      renderEventList(d,b.dataset.f);
+      _evListSig="";renderEventList(d);
     };
   });
-  renderEventList(d,"all");
+  var liveBtn=$("#evLiveBtn");
+  liveBtn.onclick=function(){
+    state.logLive=!state.logLive;
+    liveBtn.textContent=state.logLive?"暂停刷新":"继续刷新";
+    var ind=$("#evLiveInd");ind.className="log-live"+(state.logLive?"":" paused");
+    ind.querySelector("span:last-child").textContent=state.logLive?"自动刷新中":"已暂停";
+    if(state.logLive)refresh();
+  };
+  $("#evClearBtn").onclick=function(){
+    if(!confirm("清空所有持久化日志 (路由记录 + 系统事件)?"))return;
+    api("/logs/clear",{method:"POST",body:"{}"}).then(function(){toast("日志已清空");_evListSig="";refresh()}).catch(function(e){toast("清空失败: "+e.message)});
+  };
 }
-function renderEventList(d,filter){
-  var box=$("#evList");box.innerHTML="";
+function logItems(d){
   var routes=(d.routes||[]).slice();
   var events=(d.events||[]).slice();
   var items=[];
-  if(filter==="all"||filter==="system")events.forEach(function(ev){items.push({t:ev.t,kind:"event",ev:ev})});
-  if(filter==="all"||filter==="route")routes.forEach(function(r){items.push({t:r.t,kind:"route",r:r})});
+  var f=state.logFilter||"all",proxy=state.logProxy||"all",st=state.logStatus||"all";
+  function matchRoute(r){
+    if(proxy!=="all"&&r.name!==proxy)return false;
+    if(st==="ok"&&!r.ok)return false;
+    if(st==="fail"&&r.ok)return false;
+    return true;
+  }
+  function matchEv(ev){
+    if(proxy!=="all"&&ev.name!==proxy&&ev.proxy!==proxy)return false;
+    return true;
+  }
+  if(f==="all"||f==="system")events.forEach(function(ev){if(matchEv(ev))items.push({t:ev.t,kind:"event",ev:ev})});
+  if(f==="all"||f==="route")routes.forEach(function(r){if(matchRoute(r))items.push({t:r.t,kind:"route",r:r})});
   items.sort(function(a,b){return (b.t||0)-(a.t||0)});
+  return items;
+}
+function evDesc(ev){
+  if(ev.type==="status_change")return (ev.name?esc(ev.name)+" · ":"")+"状态 "+esc(ev.from||"?")+" → "+esc(ev.to||"?")+(ev.reason?" · "+esc(ev.reason):"");
+  if(ev.type==="failover")return (ev.name?esc(ev.name)+" · ":"")+"切换至下一代理 ("+(ev.code?esc(ev.code):esc(ev.status||""))+")";
+  if(ev.type==="probe_failed")return (ev.name?esc(ev.name)+" · ":"")+(ev.err?esc(ev.err):"探测失败");
+  if(ev.type==="maintenance")return (ev.name?esc(ev.name)+" · ":"")+(ev.on?"进入维护 (暂停)":"恢复服务 (启用)");
+  if(ev.type==="admin_action")return (ev.action?(ACTION_LABELS[ev.action]||esc(ev.action)):"管理操作")+(ev.name?" · "+esc(ev.name):"")+(ev.result?" → "+esc(ev.result):"");
+  if(ev.type==="smoke")return "model "+esc(ev.model||"—")+(ev.proxy?" · "+esc(ev.proxy):"")+" · HTTP "+esc(ev.status||"—")+(ev.ok?" 成功":" 失败")+(ev.ms?" · "+esc(ev.ms)+"ms":"");
+  var d2=(ev.name?esc(ev.name)+" ":"");
+  if(ev.from&&ev.to)d2+="("+esc(ev.from)+" → "+esc(ev.to)+")";
+  if(ev.code)d2+=" · "+esc(ev.code);
+  if(ev.err)d2+=" · "+esc(ev.err);
+  if(ev.detail)d2+=" · "+esc(ev.detail);
+  return d2;
+}
+function renderEventList(d){
+  var box=$("#evList");if(!box)return;
+  var items=logItems(d);
+  // 签名去重: 无新增日志时跳过重建, 避免 5s 轮询闪屏/滚动跳动
+  var sig=items.length+":"+(items[0]?items[0].t:0)+":"+(items[items.length-1]?items[items.length-1].t:0)+":"+items.map(function(i){return i.t}).join(",");
+  if(sig===_evListSig)return;
+  _evListSig=sig;
+  var content=$("#content");var st0=content?content.scrollTop:0;
+  box.innerHTML="";
   if(!items.length){
     box.innerHTML='<div class="card"><div class="empty">暂无记录 — 发起一次请求后这里会显示路由日志</div></div>';
     return;
   }
   var card=document.createElement("div");card.className="card";
   items.forEach(function(it){
-    var e=document.createElement("div");e.className="event";
+    var e=document.createElement("div");e.className="log-item";
     if(it.kind==="route"){
       var r=it.r;
-      var okCls=r.ok?'<span class="pill ok">成功</span>':'<span class="pill down">失败</span>';
-      e.innerHTML='<div class="event-ico smoke">⇄</div>'+
-        '<div class="event-main"><div class="event-title">路由 → '+esc(r.name||"—")+' '+okCls+'</div>'+
-        '<div class="event-desc">HTTP '+esc(r.status||"—")+' · 尝试 '+esc(r.attempts||1)+' 次 · '+esc(r.ms||0)+'ms'+(r.model?' · '+esc(r.model):'')+'</div>'+
-        '<div class="event-time">'+esc(fmtTime(r.t))+' · '+esc(fmtAgo(r.t))+'</div></div>';
+      e.innerHTML='<div class="li-ico '+(r.ok?"route-ok":"route-fail")+'">⇄</div>'+
+        '<div class="li-main">'+
+          '<div class="li-title">'+esc(r.name||"—")+' <span class="pill '+(r.ok?"ok":"down")+'">'+(r.ok?"成功":"失败")+'</span>'+
+            (r.model?' <span class="log-chip">'+esc(r.model)+'</span>':"")+'</div>'+
+          '<div class="li-desc">HTTP '+esc(r.status||"—")+' · 尝试 '+esc(r.attempts||1)+' 次 · '+esc(r.ms||0)+'ms</div>'+
+          '<div class="li-time">'+esc(fmtTime(r.t))+' · '+esc(fmtAgo(r.t))+'</div>'+
+        '</div>';
     }else{
       var ev=it.ev;
-      var icons={status_change:"●",failover:"⇄",probe_failed:"!",maintenance:"◐",admin_action:"⚙",smoke:"✓"};
-      var desc=ev.name?esc(ev.name)+" ":"";if(ev.from&&ev.to)desc+="("+esc(ev.from)+" → "+esc(ev.to)+")";
-      if(ev.code)desc+=" · "+esc(ev.code);if(ev.err)desc+=" · "+esc(ev.err);if(ev.detail)desc+=" · "+esc(ev.detail);
-      e.innerHTML='<div class="event-ico '+(icons[ev.type]?"":ev.type)+'">'+(icons[ev.type]||"·")+"</div>"+
-        '<div class="event-main"><div class="event-title">'+esc(ev.type)+'</div><div class="event-desc">'+desc+"</div>"+
-        '<div class="event-time">'+esc(fmtTime(ev.t))+" · "+esc(fmtAgo(ev.t))+"</div></div>";
+      var meta=EVT_META[ev.type]||{label:ev.type,ico:"·"};
+      var chip=(ev.name||ev.proxy)?' <span class="log-chip">'+esc(ev.name||ev.proxy)+'</span>':"";
+      e.innerHTML='<div class="li-ico '+esc(ev.type)+'">'+meta.ico+'</div>'+
+        '<div class="li-main">'+
+          '<div class="li-title">'+esc(meta.label)+chip+'</div>'+
+          '<div class="li-desc">'+evDesc(ev)+'</div>'+
+          '<div class="li-time">'+esc(fmtTime(ev.t))+' · '+esc(fmtAgo(ev.t))+'</div>'+
+        '</div>';
     }
     card.appendChild(e);
   });
   box.appendChild(card);
+  if(content)content.scrollTop=st0;
 }
 /* ── 渲染: 测试 ── */
 var _tModels=[]; // 模型下拉缓存
@@ -751,6 +866,9 @@ function renderSettings(d){
       '<option value="client"'+(c.pin_mode==="client"?" selected":"")+'>client (按客户端 key)</option>'+
       '<option value="header"'+(c.pin_mode==="header"?" selected":"")+'>header (按 X-Sticky-Id)</option>'+
       '<option value="off"'+(c.pin_mode==="off"?" selected":"")+'>off (不钉住)</option></select></div>'+
+    '<div class="field"><label>PROBE_MODE 探测策略</label><select class="input" id="sProbeMode">'+
+      '<option value="smart"'+(c.probe_mode!=="scan"?" selected":"")+'>smart (只探测常驻/将用代理, 不浪费空闲额度)</option>'+
+      '<option value="scan"'+(c.probe_mode==="scan"?" selected":"")+'>scan (无钉住时全量探测选最优, 消耗空闲额度)</option></select></div>'+
     '<div class="field"><label>PIN_TTL 钉住有效期 (秒)</label><input class="input" id="sPinTtl" type="number" min="60" value="'+esc(c.pin_ttl)+'"></div>'+
     '<div class="field"><label>STATE_TTL 状态刷新 (秒, ≥60)</label><input class="input" id="sStateTtl" type="number" min="60" value="'+esc(c.state_ttl)+'"></div>'+
     '<div class="field"><label>DEPLETED_PROBE 耗尽探测退避 (秒, ≥60)</label><input class="input" id="sDepletedProbe" type="number" min="60" value="'+esc(c.depleted_probe)+'"></div>'+
@@ -780,6 +898,7 @@ function renderSettings(d){
   $("#sSave").onclick=function(){
     var settings={
       pinMode:$("#sPinMode").value,
+      probeMode:$("#sProbeMode").value,
       pinTtl:parseInt($("#sPinTtl").value,10),
       stateTtl:parseInt($("#sStateTtl").value,10),
       depletedProbe:parseInt($("#sDepletedProbe").value,10),
@@ -908,6 +1027,7 @@ function cycleTheme(){
     if(!state.key||$("#login").classList.contains("show"))return;
     // 维护开关操作后短暂暂停代理页重绘, 避免旧数据把刚切换的开关弹回去
     if(state.view==="proxies"&&state.skipProxyRefreshUntil&&Date.now()<state.skipProxyRefreshUntil)return;
+    if(state.view==="events"&&!state.logLive)return; // 日志页暂停自动刷新
     api("/overview").then(function(d){
       updateDot(d);
       if(state.view==="overview")renderOverview(d);
