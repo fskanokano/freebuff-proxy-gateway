@@ -36,7 +36,8 @@ export class GatewayControl {
         const ttl = Math.max(1, Number(body.ttl || 86400));
         const old = await this.storage.get(key);
         let list = old && old.expiresAt > Date.now() && Array.isArray(old.value) ? old.value : [];
-        list = [...list, body.item].slice(-max);
+        const incoming = Array.isArray(body.item) ? body.item : [body.item];
+        list = [...list, ...incoming].slice(-max);
         await this.storage.put(key, { value: list, expiresAt: Date.now() + ttl * 1000 });
         return json({ ok: true, length: list.length });
       }
