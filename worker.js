@@ -756,8 +756,10 @@ function aggregateError(attempts, cfg) {
 async function routeRequest(req, cfg, body, opts = {}) {
   const url = new URL(req.url);
   const model = extractModel(req, body);
-  // noSticky: 内部请求 (smoke 等) 不读/不写钉住, 避免把管理会话的 key 钉进客户端 pin 空间
-  const sticky = opts.noSticky ? null : stickyKeyFor(req, cfg);
+  // noSticky: 仅内部特殊调用显式关闭; 普通请求与 smoke 默认复用 sticky
+  const sticky = opts.stickyKey !== undefined
+    ? opts.stickyKey
+    : (opts.noSticky ? null : stickyKeyFor(req, cfg));
   const isChat = req.method === 'POST' && (url.pathname === '/v1/chat/completions');
   // 判断是否流式请求: 只有缓冲的 JSON body 能可靠判断 (stream:true)。非 JSON 透传 body
   // (ReadableStream) 无法解析 → 按非流式处理, 超时窗口只覆盖响应头等待阶段, 不影响透传流。
@@ -1446,12 +1448,14 @@ async function adminSmoke(req, cfg) {
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (req._gatewayKey || 'smoke') },
     body: chatBody,
   });
+  inner._gatewayKey = req._gatewayKey || '';
   const started = nowMs();
   try {
-    // noSticky: smoke 是内部测试请求, 若带 sticky 会把管理会话的 key (可能只是 ADMIN_KEY,
-    // 甚至默认未配 ADMIN_KEY 时就是真实客户端的 API_KEY) 钉进客户端 pin 空间,
-    // 污染真实客户端的路由 (ADMIN_KEY 场景下还产生永远无人使用的 c:<adminKey> pin)。
-    const resp = await routeRequest(inner, cfg, new TextEncoder().encode(chatBody), { noSticky: true });
+    // Smoke 必须复用常规路由的 sticky 语义: 同一管理会话持续命中同一常驻代理,
+    // 避免每次 ping 重新轮询、无意义消耗不同代理额度。
+    // req._gatewayKey 由 adminAuthorized 设置: ADMIN_KEY 独立时使用独立的管理会话 pin;
+    // 未配置 ADMIN_KEY 时它就是 API_KEY, 与客户端常规路由完全一致。
+    const resp = await routeRequest(inner, cfg, new TextEncoder().encode(chatBody), { noSticky: false });
     // 读响应 (有界 256KB, smoke 是测试请求), 解析成人类可读内容
     let raw = '';
     if (resp.body) {

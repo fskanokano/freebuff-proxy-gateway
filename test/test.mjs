@@ -1514,17 +1514,19 @@ await t('CHAT2 流式 chat 不受 CHAT_TIMEOUT 限制 (流由客户端断开兜�
   assert.ok(elapsed >= 1000, 'stream must NOT be cut by chat timeout, waited ' + Math.round(elapsed) + 'ms');
 });
 
-await t('ADM19 smoke 不污染钉住: ADMIN_KEY 会话 smoke 后不产生 c:<adminKey> pin', async () => {
-  const p = await makeProxy('ad19');
-  p.ctl.mode = 'json';
-  const env = { PROXIES: p.url, GATEWAY_API_KEYS: 'pw', API_KEY: 'ck', ADMIN_KEY: 'ak' };
-  const r = await worker.fetch(new Request('https://gw.example/admin/api/smoke', { method: 'POST', headers: { Authorization: 'Bearer ak', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'freebuff-1', prompt: 'hi', stream: false }) }), env, {});
+await t('ADM19 smoke 使用管理会话常驻: ping 后产生对应 pin 且后续 smoke 命中同一代理', async () => {
+  const p1 = await makeProxy('ad19a'); const p2 = await makeProxy('ad19b');
+  p1.ctl.usagePct = 5; p2.ctl.usagePct = 50;
+  const env = { PROXIES: p1.url + ',' + p2.url, GATEWAY_API_KEYS: 'pw', API_KEY: 'ck', ADMIN_KEY: 'ak' };
+  const smoke = () => worker.fetch(new Request('https://gw.example/admin/api/smoke', { method: 'POST', headers: { Authorization: 'Bearer ak', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'freebuff-1', prompt: 'hi', stream: false }) }), env, {});
+  const r = await smoke();
   assert.equal((await r.json()).ok, true);
-  // BUG: 旧代码 smoke 走完整 routeRequest, 成功会把管理会话钉到被测 proxy
-  // (ADMIN_KEY 场景产生 c:<adminKey> 垃圾 pin; 未配 ADMIN_KEY 时污染真实客户端 key 的路由)
   const pr = await (await worker.fetch(new Request('https://gw.example/admin/api/pin', { headers: { Authorization: 'Bearer ak' } }), env, {})).json();
-  assert.equal(pr.pinned_proxy, null);
-  assert.equal(pr.sticky_key, 'c:ak');
+  assert.equal(pr.pinned_proxy, proxyNames([p1, p2])[0]);
+  const beforeA = p1.ctl.chatHits, beforeB = p2.ctl.chatHits;
+  await smoke();
+  assert.equal(p1.ctl.chatHits, beforeA + 1);
+  assert.equal(p2.ctl.chatHits, beforeB);
 });
 
 await t('ADM20 PIN_MODE=off 时清除覆盖 header 命名空间遗留 pin', async () => {
