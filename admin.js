@@ -287,6 +287,7 @@ button:active,.btn:active,.icon-btn:active,.side-item:active,.tab:active{transfo
   .sub{font-size:13px;color:#667085;margin:-6px 0 16px}
   .card,.proxy,.stat,.pin-banner{border:1px solid var(--line);box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 12px rgba(16,24,40,.03);border-radius:14px}
   .card:hover,.proxy:hover{box-shadow:0 2px 6px rgba(16,24,40,.06),0 8px 18px rgba(16,24,40,.045)}
+.proxy.pinned:hover{box-shadow:0 0 0 2px rgba(0,122,255,.35),0 2px 6px rgba(16,24,40,.06),0 8px 18px rgba(16,24,40,.045)}
   .stats{gap:10px;margin-bottom:14px}.stat{padding:16px 18px}.stat-num{font-size:26px}.stat-label{font-size:12px;color:#667085}
   #view-overview.active{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
   #view-overview.active>h2,#view-overview.active>.stats{grid-column:1/-1}
@@ -518,7 +519,7 @@ function proxyCard(pr){
     '<div class="bar-row"><span>估算用量 '+Math.round(pr.score)+"%</span><span>余量 "+(100-Math.round(pr.score))+"%</span></div>"+
     '<div class="proxy-grid">'+
     '<div class="cell"><div class="cell-label">详情</div><div class="cell-value" style="font-size:12px">'+esc(pr.detail||"—")+"</div></div>"+
-    '<div class="cell"><div class="cell-label">上次探测</div><div class="cell-value" style="font-size:12px">'+esc(fmtAgo(Date.parse(pr.last_ok||0)))+"</div></div>"+
+    '<div class="cell"><div class="cell-label">上次探测</div><div class="cell-value" style="font-size:12px">'+esc(pr.last_ok?fmtAgo(Date.parse(pr.last_ok)):"—")+"</div></div>"+
     '<div class="cell"><div class="cell-label">下次探测</div><div class="cell-value" style="font-size:12px">'+esc(pr.next_probe?fmtAgo(Date.parse(pr.next_probe)):"—")+"</div></div>"+
     '<div class="cell"><div class="cell-label">重置时刻</div><div class="cell-value" style="font-size:12px">'+esc(pr.reset_at?fmtTime(Date.parse(pr.reset_at)):"—")+"</div></div>"+
     '<div class="cell"><div class="cell-label">连续错误</div><div class="cell-value" style="font-size:12px">'+esc(pr.consecutive_errors||0)+"</div></div>"+

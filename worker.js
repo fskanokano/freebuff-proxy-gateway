@@ -536,13 +536,23 @@ async function doProbe(p, cfg) {
     st.lastError = nowMs();
     st.consecutiveErrors++;
     st.backoff = Math.min(cfg.depletedProbe, st.backoff * 2);
-    if (st.status === 'ok' || st.status === 'unknown') {
-      // healthz 失败 ≠ proxy 挂: 降级为 unknown (fail-open), 不立刻剔除
-      st.status = 'unknown';
+    if (st.status === 'unknown') {
+      // 本来就是 unknown (从未探通 / 空闲未探测): 保持 unknown, 仅记录失败
       st.reason = 'probe_failed';
       st.detail = 'healthz probe failed: ' + String(e.message || e);
+    } else if (st.status === 'ok' && st.consecutiveErrors >= 2) {
+      // ok 连续 2 次探测失败才降级: 单次 healthz 超时/瞬时错误不代表 proxy 不可用
+      // (in-band 请求成功会持续把状态拉回 ok), 避免"ok↔unknown"抖动 + 状态变更日志刷屏
+      st.status = 'unknown';
+      st.reason = 'probe_failed';
+      st.detail = 'healthz probe failed (x' + st.consecutiveErrors + '): ' + String(e.message || e);
+    } else if (st.status === 'ok') {
+      // ok 首次探测失败: 保持 ok (fail-open, 探测只刷新额度信号; 真正的 down 由带内分类判定),
+      // 记录失败并退避即可, 不产生状态变更事件
+      st.detail = 'healthz probe failed (kept ok): ' + String(e.message || e);
+      st.nextProbe = Math.max(st.nextProbe || 0, nowMs() + st.backoff * 1000);
     } else {
-      // 已 depleted/down 的保持原状, 只是记录失败
+      // 已 depleted/down/bad_config 的保持原状, 只是记录失败
       st.detail = 'probe failed: ' + String(e.message || e) + ' (backoff ' + st.backoff + 's)';
       // 保底 nextProbe: doProbe 可能被 ensureFresh/adminProbe 直接调用,
       // 确保这里持久化时异常状态的 cache TTL 与退避对齐, 不会提前过期丢状态

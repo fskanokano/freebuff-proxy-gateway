@@ -946,6 +946,24 @@ await t('PR4 healthz 缺 tokens 数组 → 探测失败', async () => {
   assert.equal(hz.status, 'unknown');
 });
 
+await t('PR6 ok 首次探测失败保持 ok, 连续 2 次才降级 (防 ok↔unknown 抖动)', async () => {
+  const p1 = await makeProxy('p6a');
+  const [n1] = proxyNames([p1]);
+  const env = envFor([p1], { API_KEY: 't-p6' });
+  // 1) 探测成功 → ok
+  let r = await worker.fetch(gwReq('/admin/api/probe', { method: 'POST', body: { name: n1 }, key: 't-p6' }), env, {});
+  assert.equal(r.status, 200);
+  assert.equal((await hzOf(env, n1)).status, 'ok');
+  // 2) 首次探测失败 → 保持 ok (不抖动, 不产生状态变更)
+  p1.ctl.healthzStatus = 500;
+  r = await worker.fetch(gwReq('/admin/api/probe', { method: 'POST', body: { name: n1 }, key: 't-p6' }), env, {});
+  assert.equal((await r.json()).results[0].status, 'ok', '单次探测失败不得把 ok 降级为 unknown');
+  assert.equal((await hzOf(env, n1)).status, 'ok');
+  // 3) 连续第 2 次失败 → 降级 unknown
+  r = await worker.fetch(gwReq('/admin/api/probe', { method: 'POST', body: { name: n1 }, key: 't-p6' }), env, {});
+  assert.equal((await r.json()).results[0].status, 'unknown', '连续 2 次探测失败才应降级为 unknown');
+});
+
 await t('PR5 /healthz 只读: 不触发探测; 探测经路由触发后状态落盘', async () => {
   const p1 = await makeProxy('p5a'); const p2 = await makeProxy('p5b');
   const [n1] = proxyNames([p1, p2]);
