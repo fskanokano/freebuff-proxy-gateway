@@ -424,10 +424,12 @@ function applyHealthz(st, h) {
     st.reason = 'cooldown';
     st.detail = 'proxy token in cooldown until ' + new Date(h.cooldownUntil).toISOString();
     st.resetAt = h.cooldownUntil;
+    st.nextProbe = h.cooldownUntil + 10 * 1000;
   } else if (h.usagePct >= 100) {
     st.status = 'depleted';
     st.reason = 'daily_cap';
     st.detail = 'daily message cap reached (usagePct=' + h.usagePct + ')';
+    st.nextProbe = st.resetAt > now ? st.resetAt + 10 * 1000 : now + 300 * 1000;
   } else {
     // 逐模型检查会话额度
     let exhausted = '';
@@ -441,13 +443,14 @@ function applyHealthz(st, h) {
       st.status = 'depleted';
       st.reason = 'model_quota';
       st.detail = 'model "' + exhausted + '" session quota exhausted';
+      st.nextProbe = st.resetAt > now ? st.resetAt + 10 * 1000 : now + 300 * 1000;
     } else {
       st.status = 'ok';
       st.reason = '';
       st.detail = 'ok (usagePct=' + h.usagePct + ')';
+      st.nextProbe = 0;
     }
   }
-  st.nextProbe = 0; // 探测后由调度者重新安排
 }
 
 async function doProbe(p, cfg) {
@@ -521,8 +524,10 @@ async function ensureFresh(p, cfg, { model, now } = {}) {
     if (st.status !== 'ok' && st.status !== 'unknown') {
       const resetSoon = st.resetAt > now ? st.resetAt + 10 * 1000 : 0;
       const delay = resetSoon
-        ? Math.max(10 * 1000, resetSoon - now)
-        : (st.backoff || cfg.depletedProbe) * 1000;
+        // reset 将至时对齐到 reset+10s, 但仍有最低 60s 兜底 —— 耗尽节点绝不能
+        // 因 reset 在 60s 内就每 10s 重探一次 (探测本身消耗额度, 增加封号风险)
+        ? Math.max(60 * 1000, resetSoon - now)
+        : Math.max(60 * 1000, (st.backoff || cfg.depletedProbe) * 1000);
       st.nextProbe = now + delay + Math.floor(Math.random() * 15 - 7) * 1000; // 抖动防羊群
       await putState(st, cfg);
     }
@@ -569,9 +574,15 @@ async function setPin(sticky, proxyName, cfg) {
 
 // 候选排序: 全部尝试顺序 (首个尝试尽量是钉住/最优, 后续为 failover 候选)
 async function buildCandidates(cfg, model, sticky) {
-  const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, { model })));
+  // 只探测真正要用的节点: 有钉住时只探测钉住的 proxy, 其余节点仅用缓存状态参与兜底,
+  // 避免每次请求对全部节点做 healthz 探测 (探测会消耗额度, 增加封号风险)。
+  let pinned = null;
+  if (sticky) pinned = await getPin(sticky, cfg);
+  const states = await Promise.all(cfg.proxies.map(p => {
+    if (pinned && p.name !== pinned) return getState(p, cfg); // 仅缓存, 不探测
+    return ensureFresh(p, cfg, { model });
+  }));
   // 维护模式: 排除维护中的 proxy (双通道: 独立 key + state.maint 标记)。
-  // 用 index 关联, 不在状态对象上打临时标记。
   const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url, cfg)));
   const usable = (s, i) => !maint[i] && !s.maint;
   const ok = states.filter((s, i) => usable(s, i) && s.status === 'ok');
@@ -581,14 +592,11 @@ async function buildCandidates(cfg, model, sticky) {
 
   let order = [];
   // 1) 钉住
-  if (sticky) {
-    const pinned = await getPin(sticky, cfg);
-    if (pinned) {
-      const idx = states.findIndex(s => s.name === pinned);
-      const st = idx >= 0 ? states[idx] : null;
-      if (st && usable(st, idx) && (st.status === 'ok' || st.status === 'unknown')) order.push(st);
-      else if (st) log(cfg, 'debug', 'pin stale, dropping', { pin: pinned, status: st.status, maint: maint[idx] });
-    }
+  if (pinned) {
+    const idx = states.findIndex(s => s.name === pinned);
+    const st = idx >= 0 ? states[idx] : null;
+    if (st && usable(st, idx) && (st.status === 'ok' || st.status === 'unknown')) order.push(st);
+    else if (st) log(cfg, 'debug', 'pin stale, dropping', { pin: pinned, status: st.status, maint: maint[idx] });
   }
   // 2) 按 score 升序的 ok
   const byScore = (a, b) => (a.score - b.score) || (a.lastUsed - b.lastUsed);

@@ -862,14 +862,24 @@ await t('FO13 探测失败时退避递增并封顶 (DEPLETED_PROBE_SECONDS)', as
   p1.ctl.healthzStatus = 500; // 探测持续失败
   for (let i = 0; i < 4; i++) {
     advance(61e3); // 让 nextProbe 过期
+    const before = p1.ctl.healthzHits;
     await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-f13' }), env, {});
+    // 钉住后只探测常驻节点: 非钉住的 p1 不应被聊天流量反复探测
+    assert.equal(p1.ctl.healthzHits, before, 'non-pinned proxy must not be probed by pinned traffic (iter ' + i + ')');
   }
   const hz = await hzOf(env, n1);
-  assert.equal(hz.status, 'down');
-  // 退避封顶验证: 距上次探测失败 (last_error) 的间隔 = backoff(60s) ± jitter(7s)
-  const gap = Date.parse(hz.next_probe) - Date.parse(hz.last_error);
-  assert.ok(gap >= 50e3 && gap <= 70e3, 'probe gap should be ~60s (capped), got ' + gap);
-  assert.ok(hz.consecutive_errors >= 2, 'consecutive failures should accumulate');
+  // 语义: 非钉住节点不再被钉住流量持续保活/探测, 其异常状态可能随缓存过期回归 unknown。
+  // 此处只断言"不会因探测风暴不断失败", 而不是旧行为里要求长期保持 down。
+  assert.ok(hz.status === 'down' || hz.status === 'unknown', 'status should be down or unknown (fail-open), got ' + hz.status);
+  // 退避/探测节奏验证: 若仍处于 down (探测过), last_error → next_probe 间隔应 ~60s;
+  // 若已回归 unknown, 说明探测失败被降级 (fail-open), 同样符合"不反复重探耗尽节点"。
+  if (hz.status === 'down' && hz.next_probe && hz.last_error) {
+    const gap = Date.parse(hz.next_probe) - Date.parse(hz.last_error);
+    assert.ok(gap >= 50e3 && gap <= 70e3, 'probe gap should be ~60s (capped), got ' + gap);
+  }
+  // 4 次迭代聊天流量没有触发对非钉住 p1 的任何探测
+  assert.equal(p1.ctl.chatHits, 1, 'p1 should only be hit once (initial failover)');
+  assert.ok(p2.ctl.chatHits >= 4, 'pinned p2 should serve subsequent chats');
   } finally { Math.random = origRandom; }
 });
 
