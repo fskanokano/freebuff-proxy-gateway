@@ -1942,6 +1942,69 @@ await t('MD1 /v1/models 聚合透传 current_access_tier', async () => {
   assert.equal(m.current_access_tier, 'limited');
 });
 
+
+await t('TR6 429 rate_limit_exceeded → 瞬时类: failover + down, 不标 depleted', async () => {
+  const p1 = await makeProxy('tr6a'); const p2 = await makeProxy('tr6b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.fail = { status: 429, code: 'rate_limit_exceeded', retryAfter: 5, body: 'client rate limit exceeded' };
+  const env = envFor([p1, p2], { API_KEY: 't-tr6' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr6' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n2);
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'down');
+  assert.equal(hz.reason, 'rate_limit_exceeded');
+});
+
+await t('TR7 413 content_too_large → 客户端错透传, 不 failover 不标 down', async () => {
+  const p = await makeProxy('tr7');
+  const [n] = proxyNames([p]);
+  p.ctl.fail = { status: 413, code: 'content_too_large', body: 'request body exceeds the 32MB limit' };
+  const env = envFor([p], { API_KEY: 't-tr7' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr7' }), env, {});
+  assert.equal(res.status, 413);
+  const j = await res.json();
+  assert.equal(j.error.code, 'content_too_large');
+  assert.equal(p.ctl.chatHits, 1);
+  const hz = await hzOf(env, n);
+  assert.equal(hz.status, 'ok');
+});
+
+await t('TR8 全 402 out_of_credits → 聚合保留 402 (非 429 rate_limited)', async () => {
+  const p1 = await makeProxy('tr8a'); const p2 = await makeProxy('tr8b');
+  p1.ctl.fail = { status: 402, code: 'out_of_credits', body: 'out of credits' };
+  p2.ctl.fail = { status: 402, code: 'out_of_credits', body: 'out of credits' };
+  const env = envFor([p1, p2], { MAX_ATTEMPTS: '2', API_KEY: 't-tr8' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr8' }), env, {});
+  assert.equal(res.status, 402);
+  const j = await res.json();
+  assert.equal(j.error.code, 'out_of_credits');
+});
+
+await t('TR9 504 upstream_timeout → 瞬时类: failover + down(短退避)', async () => {
+  const p1 = await makeProxy('tr9a'); const p2 = await makeProxy('tr9b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.fail = { status: 504, code: 'upstream_timeout', body: 'upstream request timed out' };
+  const env = envFor([p1, p2], { API_KEY: 't-tr9' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr9' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n2);
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'down');
+  assert.equal(hz.reason, 'upstream_timeout');
+});
+
+await t('SP5 每模型会话额度梯度: 同 UsagePct/SpendPct 时按请求模型余量选路', async () => {
+  const a = await makeProxy('sp5a'); const b = await makeProxy('sp5b');
+  const [, nb] = proxyNames([a, b]);
+  a.ctl.quota = { 'freebuff-1': { limit: 10, recentCount: 9 } };
+  b.ctl.quota = { 'freebuff-1': { limit: 10, recentCount: 1 } };
+  const env = envFor([a, b], { API_KEY: 't-sp5', PROBE_MODE: 'scan' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-sp5' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), nb);
+});
+
 // 收尾
 for (const m of allProxies) await m.close();
 console.log(`\n${passed} passed, ${failed} failed`);

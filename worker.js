@@ -386,7 +386,7 @@ function probeOnce(p, cfg) {
 // 解析 proxy /healthz。pooled 模式取 tokens[0] (每实例 1 token); bridge/hybrid 模式
 // tokens 可能为空 (客户端自带 token, proxy 不持有额度视图) → 归一化为中性 score 50,
 // 不视为探测失败 (否则 bridge 实例会被永久标 unknown/probe_failed)。
-function parseHealthz(json, model) {
+function parseHealthz(json) {
   const mode = String((json && json.mode) || '');
   const bridgeTokens = Number((json && json.bridge_tokens)) || 0;
   const t = Array.isArray(json && json.tokens) ? json.tokens[0] : null;
@@ -425,9 +425,10 @@ function parseHealthz(json, model) {
   const spendPct = Number.isFinite(Number(t.SpendPct))
     ? Math.max(0, Math.min(100, Number(t.SpendPct)))
     : (spendLimit > 0 ? Math.min(100, Math.round((spendDay / spendLimit) * 100)) : 0);
-  const mq = model && quota[model];
-  const modelUsage = mq && mq.limit > 0 ? (mq.recentCount / mq.limit) * 100 : null;
-  let score = Math.max(usagePct, spendPct, modelUsage === null ? 0 : modelUsage);
+  // score 只含探测时可知的信号 (UsagePct + SpendPct)。每模型会话额度梯度在候选排序阶段
+  // 用已持久化的 st.quota[model] 折合 (见 modelScore/buildCandidates): 探测是单飞(name+url 去重),
+  // 无法按请求模型各自探测, 故不能在这里传入 model。
+  let score = Math.max(usagePct, spendPct);
   // critical 风险账号降权但不剔除
   if (t.RiskLevel === 'critical') score = Math.max(score, 90);
   return {
@@ -510,8 +511,7 @@ async function doProbe(p, cfg) {
     clearTimeout(to);
     if (res.status !== 200) throw new Error('healthz HTTP ' + res.status);
     const json = await res.json();
-    const h = parseHealthz(json, null);
-    if (!h) throw new Error('healthz missing tokens[0]');
+    const h = parseHealthz(json);
     applyHealthz(st, h);
     st.lastOk = nowMs();
     st.consecutiveErrors = 0;
@@ -648,6 +648,15 @@ function pickPreferred(states, usable, pinned) {
   return states[rest[0]].name;
 }
 
+// 折合请求模型的每模型会话额度: 探测时拿不到请求模型 (单飞按 name+url 去重), 故在候选排序
+// 阶段用已持久化的 st.quota[model] 计算, 让请求模型余量多的 proxy 优先。
+function modelScore(s, model) {
+  if (!model || !s.quota || !s.quota[model]) return s.score;
+  const q = s.quota[model];
+  if (!(q.limit > 0)) return s.score;
+  return Math.max(s.score, Math.round((q.recentCount / q.limit) * 100));
+}
+
 // 候选排序: 全部尝试顺序 (首个尝试尽量是钉住/最优, 后续为 failover 候选)
 async function buildCandidates(cfg, model, sticky) {
   // 探测策略 (PROBE_MODE):
@@ -686,8 +695,8 @@ async function buildCandidates(cfg, model, sticky) {
     if (st && usable(st, idx) && (st.status === 'ok' || st.status === 'unknown')) order.push(st);
     else if (st) log(cfg, 'debug', 'pin stale, dropping', { pin: pinned, status: st.status, maint: maint[idx] });
   }
-  // 2) 按 score 升序的 ok
-  const byScore = (a, b) => (a.score - b.score) || (a.lastUsed - b.lastUsed);
+  // 2) 按 score 升序的 ok (score 折合请求模型的每模型会话额度: 余量多的优先)
+  const byScore = (a, b) => (modelScore(a, model) - modelScore(b, model)) || (a.lastUsed - b.lastUsed);
   for (const s of ok.sort(byScore)) if (!order.includes(s)) order.push(s);
   // 3) unknown (fail-open 兜底)
   for (const s of unknown.sort(byScore)) if (!order.includes(s)) order.push(s);
@@ -742,6 +751,11 @@ const TRANSIENT_CODES = new Set([
   'ip_capped', 'load_shedding', 'peak_hours', 'free_mode_capacity_deferred',
   'session_limit_reached', 'model_ip_limited',
   'waiting_room_queued', 'waiting_room_required', 'session_superseded', 'upstream_retryable',
+  // issue #137: proxy 本地 per-source-IP 限流 —— 网关把 N 客户端收敛到同一出口 IP 时必现,
+  // 与 token 额度无关 → 瞬时类, 绝不标 depleted。
+  'rate_limit_exceeded',
+  // proxy 自身健康、其上游(FreeBuff)请求超时 → 瞬时类, 短退避重试 (同 upstream_retryable 家族)。
+  'upstream_timeout',
 ]);
 async function classify(resp) {
   const status = resp.status;
@@ -764,7 +778,9 @@ async function classify(resp) {
       if (TRANSIENT_CODES.has(code)) return { kind: 'retry', resp, text, code, retryAfterS, reset };
       return { kind: 'surface', resp, text, code };
     case 503:
-      // waiting_room_*/session_superseded/upstream_retryable: 上游瞬时队列/接管, 短退避重试
+    case 504:
+      // waiting_room_*/session_superseded/upstream_retryable (503) 与 upstream_timeout (504):
+      // 上游瞬时队列/接管/超时, 短退避重试, 不标 proxy 挂。
       if (TRANSIENT_CODES.has(code)) return { kind: 'retry', resp, text, code, retryAfterS, reset };
       return { kind: 'down', resp, text, code };
     case 401: return { kind: 'bad_config', resp, text, code };
@@ -772,7 +788,11 @@ async function classify(resp) {
       if (code === 'upstream_auth_rejected') return { kind: 'bad_config', resp, text, code, retryAfterS, reset };
       return { kind: 'down', resp, text, code };
     case 400:
-    case 404: return { kind: 'surface', resp, text, code }; // 客户端错, 不 failover
+    case 404:
+    case 413: // content_too_large: 客户端 body 超 32MB, 与 proxy 健康无关
+    case 405: // method not allowed
+    case 422: // unprocessable entity
+      return { kind: 'surface', resp, text, code }; // 客户端错, 不 failover
     default:  return { kind: 'down', resp, text, code };    // 5xx 等
   }
 }
@@ -950,6 +970,12 @@ function aggregateError(attempts, cfg) {
       if (ra > 0) retryAfter = retryAfter === 0 ? ra : Math.min(retryAfter, ra);
     }
     const names = [...new Set(attempts.map(a => a.name))].join(', ');
+    // 全部 402 out_of_credits → 保留 402 语义 (上游免费额度耗尽), 不折叠成 429 rate_limited
+    if (quotas.length === attempts.length && quotas.every(q => q.code === 'out_of_credits')) {
+      return { error: errorResponse(402, 'out_of_credits',
+        'All proxies are out of upstream credits: ' + names + '. Check COST_MODE=free on the proxies or add another token.',
+        { retryAfter: retryAfter || 60, hint: 'Upstream free-tier credits exhausted. Add a token or wait for reset.' }) };
+    }
     return { error: errorResponse(429, 'rate_limited',
       'All proxies are quota-exhausted: ' + names + '. Wait for quota reset or add another token.',
       { retryAfter: retryAfter || 60, hint: 'Daily/session quota reached. Retry after reset.' }) };

@@ -170,11 +170,11 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 | 429 `rate_limited` / 402 `out_of_credits` | depleted | 解析 `Retry-After`（秒数或 HTTP-date 均可）与 body 里 `reset at <RFC3339>`，`nextProbe = resetAt+10s`；reset 缺失/非法/在过去时回退指数退避（防止重探风暴）；重放请求切换 |
 | 403 `account_banned` | depleted(banned) | 解析 body 里 `resumes at <RFC3339>`（或 `Retry-After`）对齐 `nextProbe = resumes+10s`；无时间时长退避（≥300s） |
 | 403 `country_blocked` | down | 区域限制（非 token 问题），指数退避 120→300s |
-| 429 `ip_capped`/`load_shedding`/`peak_hours`/`free_mode_capacity_deferred`、409 `session_limit_reached`/`model_ip_limited`、503 `waiting_room_*`/`session_superseded`/`upstream_retryable` | down（瞬时） | **瞬时类**：短退避对齐 `Retry-After`，failover 换 proxy，**不**标 depleted（额度没耗尽） |
+| 429 `ip_capped`/`load_shedding`/`peak_hours`/`free_mode_capacity_deferred`/`rate_limit_exceeded`、409 `session_limit_reached`/`model_ip_limited`、503 `waiting_room_*`/`session_superseded`/`upstream_retryable`、504 `upstream_timeout` | down（瞬时） | **瞬时类**：短退避对齐 `Retry-After`，failover 换 proxy，**不**标 depleted（额度没耗尽）。`rate_limit_exceeded` 是 proxy 本地 per-IP 限流（网关把 N 客户端收敛到同一出口 IP 时常见），与 token 额度无关 |
 | 502 `upstream_auth_rejected` | bad_config | proxy 自身上游 token 失效，退避重试，最终 502 |
 | 401（proxy 拒绝网关 key） | bad_config | 退避重试，最终 502 提示检查 PROXIES 配置 |
 | 非流式 chat 单次尝试超时（`CHAT_TIMEOUT_MS`，默认 120s） | down | 网关主动中止挂死（不响应）的尝试并 failover；流式不受限 |
-| 400 / 404（客户端错） | — | 原样透传，**不** failover |
+| 400 / 404 / 413 `content_too_large` / 405 / 422（客户端错） | — | 原样透传，**不** failover |
 
 **探测策略**（懒触发，无后台循环）：
 - ok proxy：`STATE_TTL`（60s）到期且被请求需要时才重新探 `/healthz`（探测零成本——proxy 的 healthz 不触达 FreeBuff 上游）
