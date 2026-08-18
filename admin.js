@@ -192,6 +192,86 @@ h2.section{font-size:22px;font-weight:700;letter-spacing:-.02em;margin:2px 0 14p
 .sub{font-size:13px;color:var(--text2);margin:-10px 0 14px}
 .spin{display:inline-block;animation:rot 1s linear infinite}
 @keyframes rot{to{transform:rotate(360deg)}}
+
+
+/* ─────────────────────────────────────────────────────────────
+   2026 UI redesign: mobile app console + desktop operations console
+   Built from apple-design / emil-design-eng principles:
+   direct feedback, restrained motion, optical hierarchy, no layout jumps.
+───────────────────────────────────────────────────────────── */
+:root{
+  --ease-ui:cubic-bezier(.23,1,.32,1);
+  --ease-move:cubic-bezier(.77,0,.175,1);
+  --ink:#101828;--muted:#667085;--line:#e4e7ec;
+  --surface:#fff;--surface-soft:#f8fafc;--canvas:#f5f7fb;
+  --accent:#2563eb;--accent-soft:#eff6ff;
+}
+body{background:var(--canvas);color:var(--ink);font-size:15px}
+button,.btn,.icon-btn,.side-item,.tab,.switch,.proxy,.card,.stat{transition:transform 160ms var(--ease-ui),background-color 160ms ease-out,border-color 160ms ease-out,box-shadow 160ms ease-out,opacity 160ms ease-out}
+button:active,.btn:active,.icon-btn:active,.side-item:active,.tab:active{transform:scale(.97)}
+.view.active{animation:view-enter 180ms var(--ease-ui)}
+@keyframes view-enter{from{opacity:.75;transform:translateY(3px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.view.active{animation:none}button,.btn,.icon-btn,.side-item,.tab,.switch,.proxy,.card,.stat{transition:none!important}}
+/* ── Mobile: app-like operations surface ── */
+@media (max-width:767px){
+  :root{--canvas:#f4f6fa;--surface:#fff;--surface-soft:#f8fafc;--line:#e7eaf0}
+  body{font-size:15px}
+  .app{max-width:none;background:var(--canvas)}
+  .nav{padding:calc(env(safe-area-inset-top) + 12px) 16px 11px;background:rgba(244,246,250,.86);border-bottom:1px solid rgba(16,24,40,.06)}
+  .nav-title{font-size:18px;letter-spacing:-.025em}.nav-dot{width:8px;height:8px}
+  .icon-btn{width:38px;height:38px;background:#e9eef7;color:#344054}
+  .content{padding:18px 14px calc(74px + env(safe-area-inset-bottom));}
+  h2.section{font-size:28px;line-height:1.08;letter-spacing:-.045em;margin:0 0 18px}
+  .sub{font-size:13px;line-height:1.5;color:#667085;margin:-10px 2px 16px}
+  .card,.proxy,.stat,.pin-banner{border:1px solid rgba(16,24,40,.06);box-shadow:0 2px 12px rgba(16,24,40,.045);border-radius:18px}
+  .card{margin-bottom:12px}.card-head{padding:15px 16px 9px}.card-body{padding:3px 16px 16px}
+  .stats{gap:9px;margin-bottom:12px}.stat{padding:15px 14px;border-radius:16px}.stat-num{font-size:25px}.stat-label{font-size:11px}
+  .cell{min-height:46px;padding:11px 16px}.cell-label{font-size:14px}.cell-value{font-size:14px}
+  .proxy{margin-bottom:12px}.proxy-head{padding:15px 14px 0;align-items:flex-start}.proxy-name{font-size:16px;gap:6px}.proxy-url{max-width:190px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .proxy-actions{gap:5px}.proxy-actions .icon-btn{width:34px;height:34px;font-size:14px!important}.switch{width:48px;height:29px}.switch::after{width:25px;height:25px}.switch.on::after{transform:translateX(19px)}
+  .proxy-grid{gap:0 12px}.proxy-grid .cell{padding:7px 0}.proxy-grid .cell-label{font-size:12px}.proxy-grid .cell-value{font-size:11px;max-width:130px}
+  .proxy-cards{display:block}.bar{height:7px}.bar-row{font-size:11px}
+  .pin-banner{padding:13px 14px;margin-bottom:12px;align-items:flex-start}.pin-banner .pin-sub{font-size:11px;line-height:1.45}.pin-banner .pin-clear{white-space:nowrap;padding:8px 11px}
+  .seg{margin-bottom:12px}.seg button{min-height:36px}
+  .input{min-height:46px;font-size:16px;border:1px solid #e4e7ec;background:#fff}
+  .btn{min-height:46px;border-radius:13px}.btn.secondary{background:#edf2fa}
+  .event{padding:12px 14px}.event-ico{width:32px;height:32px}.event-title{font-size:13px}.event-desc{font-size:11px;line-height:1.45}
+  #evFilter{position:sticky;top:-18px;z-index:4;padding:3px;background:rgba(244,246,250,.92);backdrop-filter:blur(16px);margin-bottom:12px}
+  .login{align-items:flex-end;padding:0}.login-card{max-width:none;border-radius:22px 22px 0 0;padding:25px 20px calc(24px + env(safe-area-inset-bottom));}
+  #proxyModal{align-items:flex-end;padding:0}.login-card{max-height:92dvh;overflow-y:auto}
+  #sSave,#sReset{min-height:46px}.field{margin-bottom:14px}
+  .toast{bottom:calc(72px + env(safe-area-inset-bottom));font-size:13px}
+}
+/* ── Desktop: operations console ── */
+@media (min-width:1024px){
+  :root{--canvas:#f5f7fb;--surface:#fff;--surface-soft:#f8fafc;--line:#e4e7ec}
+  body{font-family:Inter,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;background:var(--canvas)}
+  .app{max-width:1440px;background:var(--canvas)}
+  .nav{height:70px;padding:0 32px;background:#fff;border-bottom:1px solid var(--line);backdrop-filter:none}
+  .nav-title{font-size:18px;color:#101828}.nav-dot{box-shadow:0 0 0 4px #ecfdf3}
+  .nav-actions{gap:8px}.icon-btn{width:38px;height:38px;background:#f2f4f7;color:#344054}
+  .layout{min-height:0}.sidebar{display:flex;width:246px;padding:20px 14px;background:#101828;border-right:0;color:#d0d5dd}
+  .sidebar:before{content:"CONTROL CENTER";display:block;color:#98a2b3;font-size:10px;letter-spacing:.13em;font-weight:700;padding:0 12px 12px}
+  .side-item{color:#98a2b3;padding:12px 13px;border-radius:10px;font-size:14px;margin-bottom:4px}
+  .side-item:hover{background:rgba(255,255,255,.08);color:#fff}.side-item.active{background:#1d4ed8;color:#fff;box-shadow:0 5px 14px rgba(37,99,235,.22)}
+  .content{padding:32px 38px 46px;max-width:1180px;margin:0 auto;width:100%}
+  h2.section{font-size:30px;line-height:1.08;letter-spacing:-.045em;margin:0 0 18px;color:#101828}
+  .sub{font-size:13px;color:#667085;margin:-10px 0 18px}.card,.proxy,.stat,.pin-banner{border:1px solid var(--line);box-shadow:0 1px 3px rgba(16,24,40,.035),0 8px 20px rgba(16,24,40,.035);border-radius:16px}
+  .card:hover,.proxy:hover{box-shadow:0 3px 8px rgba(16,24,40,.06),0 14px 28px rgba(16,24,40,.045)}
+  .stats{gap:12px;margin-bottom:16px}.stat{padding:18px 19px}.stat-num{font-size:30px}.stat-label{font-size:12px;color:#667085}
+  #view-overview.active{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(340px,.85fr);gap:16px;align-items:start}
+  #view-overview.active>h2,#view-overview.active>.stats{grid-column:1/-1}
+  #view-overview.active>.card{margin:0}.card-head{padding:16px 18px 11px}.card-body{padding:3px 18px 18px}
+  .proxy-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.proxy-cards .proxy{margin:0}
+  .proxy-head{padding:16px 18px 0}.proxy-actions{gap:6px}.proxy-actions .icon-btn{width:34px;height:34px}.proxy-grid{gap:2px 24px}
+  .pin-banner{grid-column:1/-1;padding:15px 18px;margin-bottom:0}.btn{width:auto;min-height:42px;padding:10px 20px}.input{min-height:44px}
+  #view-events.active{max-width:980px;margin:0 auto}.event{padding:13px 18px}.event-title{font-size:14px}.event-desc{font-size:12px}
+  #view-test.active{max-width:720px;margin:0 auto}.result{font-size:13px;line-height:1.65}
+  #view-settings.active{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:start}
+  #view-settings.active>h2,#view-settings.active>.sub{grid-column:1/-1;margin-bottom:0}.field{margin-bottom:14px}
+  .login{background:rgba(16,24,40,.45)}.login-card{border:1px solid rgba(255,255,255,.4)}
+}
+
 </style>
 </head>
 <body>
