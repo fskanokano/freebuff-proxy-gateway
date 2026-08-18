@@ -102,10 +102,19 @@ export class GatewayControl {
     try {
       if (typeof this.storage.list !== 'function') return removed;
       const all = await this.storage.list();
+      const expired = [];
       for (const [k, item] of all) {
-        if (!item || (item.expiresAt && item.expiresAt <= now)) {
-          try { await this.storage.delete(k); removed++; } catch (e) { /* 忽略 */ }
+        if (!item || (item.expiresAt && item.expiresAt <= now)) expired.push(k);
+      }
+      if (expired.length) {
+        // 批量(并行)删除而非串行 await: 单线程 DO 串行删 1000+ 过期 key 会阻塞数十秒,
+        // 把后台读请求全堵在队列里 → 表现为后台"卡住一段时间后自己恢复"。
+        if (typeof this.storage.deleteAll === 'function') {
+          await this.storage.deleteAll(expired);
+        } else {
+          await Promise.all(expired.map(k => this.storage.delete(k).catch(() => {})));
         }
+        removed = expired.length;
       }
     } catch (e) { /* 尽力而为 */ }
     return removed;

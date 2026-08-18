@@ -1806,6 +1806,38 @@ await t('DO4 /gc 端点手动触发清理', async () => {
   assert.equal(j.removed, 1);
 });
 
+await t('DO5 worker 经 GATEWAY_CONTROL 绑定读写 (防 controlFetch 递归回归)', async () => {
+  const { GatewayControl } = await import(new URL('../control.js', import.meta.url).href);
+  const storage = makeMockStorage();
+  const ctl = new GatewayControl({ storage }, {});
+  // 模拟 DO binding: idFromName + get(id) → stub.fetch 委托给 GatewayControl
+  const namespace = {
+    idFromName: () => 'global',
+    get: () => ({ fetch: (input, init) => ctl.fetch(new Request(input, init)) }),
+  };
+  const p = await makeProxy('d5');
+  const env = envFor([p], { GATEWAY_CONTROL: namespace });
+
+  // 1) controlGet 往返 (曾是 controlFetch 无限递归点): 先写 pin 到 DO, 再经 GET /admin/api/pin 读回
+  await ctl.fetch(new Request('https://control/put?key=' + encodeURIComponent('pin:c:testkey1'),
+    { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: { proxy: 'd5', at: Date.now() }, ttl: 3600 }) }));
+  const rp = await worker.fetch(gwReq('/admin/api/pin', { method: 'GET' }), env, {});
+  assert.equal(rp.status, 200);
+  const pj = await rp.json();
+  assert.equal(pj.pinned_proxy, 'd5', 'pin 应经 DO 读回 (controlGet 不得静默降级到空缓存)');
+
+  // 2) controlPut/controlAppend/controlList 往返: 写维护开关 + 事件, overview 读回
+  const r0 = await worker.fetch(gwReq('/admin/api/overview', { method: 'GET' }), env, {});
+  const j0 = await r0.json();
+  const name = j0.proxies[0].name;
+  const r1 = await worker.fetch(gwReq('/admin/api/maintenance', { method: 'POST', body: { name, on: true } }), env, {});
+  assert.equal(r1.status, 200);
+  const r2 = await worker.fetch(gwReq('/admin/api/overview', { method: 'GET' }), env, {});
+  const j2 = await r2.json();
+  assert.equal(j2.proxies[0].maint, true, '维护开关应经 DO 往返');
+  assert.ok(Array.isArray(j2.events) && j2.events.length > 0, '事件日志应经 DO 往返');
+});
+
 
 console.log('\n== proxy 新版契约适配 (spend 信号 / 瞬时错误 / 新模式 / 新端点) ==');
 
