@@ -45,6 +45,7 @@ const allProxies = [];
 export function makeProxy(name) {
   const ctl = {
     name, usagePct: 0, cooldownUntilMs: 0, quota: {}, fail: null, mode: 'sse',
+    spendPct: 0, spendLimit: 0, spendDay: 0, spendLimited: 0, bridgeMode: false, accessTier: 'full',
     healthzStatus: 200, healthzBody: null, healthzDelay: 0,
     chatDelay: 0, modelsDelay: 0,
     chatHits: 0, healthzHits: 0, modelsHits: 0, lastModel: null, lastBody: '',
@@ -59,18 +60,26 @@ export function makeProxy(name) {
       const send = () => {
         res.writeHead(ctl.healthzStatus, { 'Content-Type': 'application/json' });
         if (ctl.healthzBody !== null) res.end(ctl.healthzBody);
-        else res.end(JSON.stringify({ status: 'ok', mode: 'pooled', tokens: [{
-          Token: 0,
-          CooldownUntil: ctl.cooldownUntilMs ? new Date(ctl.cooldownUntilMs).toISOString() : '0001-01-01T00:00:00Z',
-          SessionStatus: 'ready',
-          Messages24h: Math.round((ctl.usagePct / 100) * 20),
-          DailyLimit: 20,
-          UsagePct: ctl.usagePct,
-          RiskLevel: 'low',
-          quota: Object.fromEntries(Object.entries(ctl.quota).map(([m, q]) => [
-            m, { limit: q.limit, recent_count: q.recentCount, reset_at: q.resetAtMs ? new Date(q.resetAtMs).toISOString() : null, period: 'pacific_day' },
-          ])),
-        }] }));
+        else if (ctl.bridgeMode) {
+          res.end(JSON.stringify({ status: 'ok', mode: 'bridge', tokens: [], bridge_tokens: 3 }));
+        } else {
+          res.end(JSON.stringify({ status: 'ok', mode: 'pooled', bridge_tokens: 0, tokens: [{
+            Token: 0,
+            CooldownUntil: ctl.cooldownUntilMs ? new Date(ctl.cooldownUntilMs).toISOString() : '0001-01-01T00:00:00Z',
+            SessionStatus: 'ready',
+            Messages24h: Math.round((ctl.usagePct / 100) * 20),
+            DailyLimit: 20,
+            UsagePct: ctl.usagePct,
+            RiskLevel: 'low',
+            SpendDay: ctl.spendDay,
+            SpendLimit: ctl.spendLimit,
+            SpendPct: ctl.spendPct,
+            SpendLimited: ctl.spendLimited,
+            quota: Object.fromEntries(Object.entries(ctl.quota).map(([m, q]) => [
+              m, { limit: q.limit, recent_count: q.recentCount, reset_at: q.resetAtMs ? new Date(q.resetAtMs).toISOString() : null, period: 'pacific_day' },
+            ])),
+          }] }));
+        }
       };
       if (ctl.healthzDelay > 0) setTimeout(send, ctl.healthzDelay); else send();
       return;
@@ -80,7 +89,7 @@ export function makeProxy(name) {
       const send = () => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ object: 'list', data: [
-          { id: 'freebuff-1', object: 'model', created: 1, owned_by: 'freebuff', available: ctl.usagePct < 100, status: ctl.usagePct < 100 ? 'available' : 'quota_exhausted' },
+          { id: 'freebuff-1', object: 'model', created: 1, owned_by: 'freebuff', available: ctl.usagePct < 100, status: ctl.usagePct < 100 ? 'available' : 'quota_exhausted', current_access_tier: ctl.accessTier },
         ] }));
       };
       // modelsDelay: 超过网关 probeTimeout 才响应 (测 /v1/models 上游超时中止)
@@ -88,7 +97,7 @@ export function makeProxy(name) {
       else send();
       return;
     }
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
+    if ((url.pathname === '/v1/chat/completions' || url.pathname === '/v1/responses' || url.pathname === '/v1/messages') && req.method === 'POST') {
       ctl.chatHits++;
       ctl.lastAuth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
       let raw = '';
@@ -1795,6 +1804,142 @@ await t('DO4 /gc 端点手动触发清理', async () => {
   const j = await r.json();
   assert.equal(j.ok, true);
   assert.equal(j.removed, 1);
+});
+
+
+console.log('\n== proxy 新版契约适配 (spend 信号 / 瞬时错误 / 新模式 / 新端点) ==');
+
+await t('SP1 SpendPct 参与评分: 消息额度低但消费额度高 → 选消费余量多的', async () => {
+  const a = await makeProxy('sp1a'); const b = await makeProxy('sp1b');
+  const [, nb] = proxyNames([a, b]);
+  a.ctl.usagePct = 10; a.ctl.spendPct = 90;   // 消息额度低但消费额度接近上限 → score 90
+  b.ctl.usagePct = 20; b.ctl.spendPct = 0;    // score 20
+  const env = envFor([a, b], { API_KEY: 't-sp1', PROBE_MODE: 'scan' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-sp1' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), nb);
+});
+
+await t('SP2 SpendPct=100 → spend_cap 耗尽 (不靠消息数)', async () => {
+  const p = await makeProxy('sp2');
+  const [n] = proxyNames([p]);
+  p.ctl.spendPct = 100;
+  const env = envFor([p], { API_KEY: 't-sp2' });
+  await worker.fetch(new Request('https://gw.example/admin/api/probe', { method: 'POST', headers: { Authorization: 'Bearer t-sp2', 'Content-Type': 'application/json' }, body: JSON.stringify({ name: n }) }), env, {});
+  const hz = await hzOf(env, n);
+  assert.equal(hz.status, 'depleted');
+  assert.equal(hz.reason, 'spend_cap');
+  assert.equal(hz.spend_pct, 100);
+});
+
+await t('SP3 SpendPct 缺失时由 SpendDay/SpendLimit 推导', async () => {
+  const p = await makeProxy('sp3');
+  const [n] = proxyNames([p]);
+  p.ctl.healthzBody = JSON.stringify({ status: 'ok', mode: 'pooled', tokens: [{ Token: 0, UsagePct: 0, DailyLimit: 0, SpendLimit: 100, SpendDay: 80 }] });
+  const env = envFor([p], { API_KEY: 't-sp3' });
+  await worker.fetch(new Request('https://gw.example/admin/api/probe', { method: 'POST', headers: { Authorization: 'Bearer t-sp3', 'Content-Type': 'application/json' }, body: JSON.stringify({ name: n }) }), env, {});
+  const hz = await hzOf(env, n);
+  assert.equal(hz.spend_pct, 80);
+  assert.equal(hz.score, 80);
+});
+
+await t('SP4 bridge 模式 tokens 为空 → 中性 score, 不标 probe_failed', async () => {
+  const p = await makeProxy('sp4');
+  const [n] = proxyNames([p]);
+  p.ctl.bridgeMode = true;
+  const env = envFor([p], { API_KEY: 't-sp4' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-sp4' }), env, {});
+  assert.equal(res.status, 200);
+  const hz = await hzOf(env, n);
+  assert.equal(hz.status, 'ok');
+  assert.equal(hz.score, 50);
+  assert.equal(hz.mode, 'bridge');
+  assert.equal(hz.bridge_tokens, 3);
+});
+
+await t('TR1 429 ip_capped → 瞬时类: failover + down(短退避), 不标 depleted', async () => {
+  const p1 = await makeProxy('tr1a'); const p2 = await makeProxy('tr1b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.fail = { status: 429, code: 'ip_capped', retryAfter: 45, body: '{"status":"ip_capped"}' };
+  const env = envFor([p1, p2], { API_KEY: 't-tr1' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr1' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n2);
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'down');
+  assert.equal(hz.reason, 'ip_capped');
+});
+
+await t('TR2 503 waiting_room_queued → 瞬时类: failover + down', async () => {
+  const p1 = await makeProxy('tr2a'); const p2 = await makeProxy('tr2b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.fail = { status: 503, code: 'waiting_room_queued', retryAfter: 20, body: 'queue' };
+  const env = envFor([p1, p2], { API_KEY: 't-tr2' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr2' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n2);
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'down');
+  assert.equal(hz.reason, 'waiting_room_queued');
+});
+
+await t('TR3 502 upstream_auth_rejected → bad_config (上游 token 失效)', async () => {
+  const p1 = await makeProxy('tr3a'); const p2 = await makeProxy('tr3b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.fail = { status: 502, code: 'upstream_auth_rejected', body: 'token invalid' };
+  const env = envFor([p1, p2], { API_KEY: 't-tr3' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr3' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-gateway-proxy'), n2);
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'bad_config');
+});
+
+await t('TR4 403 account_banned 带 resumes_at → nextProbe 对齐 resumes_at+10s', async () => {
+  const p1 = await makeProxy('tr4a'); const p2 = await makeProxy('tr4b');
+  const [n1] = proxyNames([p1, p2]);
+  const resumes = new Date(Date.now() + 3600e3).toISOString();
+  p1.ctl.fail = { status: 403, code: 'account_banned', retryAfter: 3600, body: 'upstream account banned (resumes at ' + resumes + ')' };
+  const env = envFor([p1, p2], { API_KEY: 't-tr4' });
+  await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr4' }), env, {});
+  const hz = await hzOf(env, n1);
+  assert.equal(hz.status, 'depleted');
+  assert.equal(hz.reason, 'banned');
+  const drift = Math.abs(Date.parse(hz.next_probe) - (Date.parse(resumes) + 10e3));
+  assert.ok(drift < 5000, 'nextProbe should align to resumes_at+10s, drift=' + drift);
+});
+
+await t('TR5 全瞬时拒绝 → 聚合 503 upstream_retryable + Retry-After', async () => {
+  const p1 = await makeProxy('tr5a'); const p2 = await makeProxy('tr5b');
+  p1.ctl.fail = { status: 429, code: 'ip_capped', retryAfter: 30, body: 'x' };
+  p2.ctl.fail = { status: 503, code: 'waiting_room_queued', retryAfter: 60, body: 'y' };
+  const env = envFor([p1, p2], { MAX_ATTEMPTS: '2', API_KEY: 't-tr5' });
+  const res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-tr5' }), env, {});
+  assert.equal(res.status, 503);
+  const j = await res.json();
+  assert.equal(j.error.code, 'upstream_retryable');
+  assert.ok(Number(res.headers.get('retry-after')) >= 15);
+});
+
+await t('EP1 /v1/responses stream:true 不受 CHAT_TIMEOUT 截断', async () => {
+  const p = await makeProxy('ep1');
+  p.ctl.mode = 'sse';
+  p.ctl.chatDelay = 1500;   // 流式响应 1.5s 才写头 (超过 CHAT_TIMEOUT 1s)
+  const env = envFor([p], { API_KEY: 't-ep1', CHAT_TIMEOUT_MS: '1000' });
+  const res = await worker.fetch(gwReq('/v1/responses', { body: { model: 'freebuff-1', stream: true, input: 'hi' }, key: 't-ep1' }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-type'), 'text/event-stream');
+});
+
+await t('MD1 /v1/models 聚合透传 current_access_tier', async () => {
+  const p = await makeProxy('md1');
+  p.ctl.accessTier = 'limited';
+  const env = envFor([p], { API_KEY: 't-md1' });
+  const res = await worker.fetch(gwReq('/v1/models', { method: 'GET', key: 't-md1' }), env, {});
+  const j = await res.json();
+  const m = j.data.find(x => x.id === 'freebuff-1');
+  assert.ok(m, 'model present');
+  assert.equal(m.current_access_tier, 'limited');
 });
 
 // 收尾

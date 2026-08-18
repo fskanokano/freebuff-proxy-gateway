@@ -3,12 +3,13 @@
  *
  * 拓扑:  N 个 freebuff-proxy 实例, 每实例只配 1 个 FreeBuff token。
  *        本 Worker 部署在 CF 边缘, 作为统一 OpenAI 兼容入口:
- *          - 按剩余额度选路: 读取各 proxy 的 /healthz (UsagePct + 每模型会话额度),
+ *          - 按剩余额度选路: 读取各 proxy 的 /healthz (UsagePct + SpendPct 消费额度 + 每模型会话额度),
  *            选 score 最低(余量最多)的 proxy
  *          - 钉住 (sticky pin): 同一客户端(或 X-Sticky-Id)持续路由到当前 proxy,
  *            直到它额度耗尽
  *          - 带内失败切换: 429/402(额度类)/403/5xx/网络错 → 标记状态, 重放请求
- *            切换到下一 proxy
+ *            切换到下一 proxy; 瞬时类上游拒绝(ip_capped/等待队列/容量延迟等)
+ *            短退避换 proxy, 不误标额度耗尽
  *          - 智能恢复探测: 对 depleted/down 的 proxy 按退避(60→300s)或
  *            resetAt+10s 懒探测 /healthz, 恢复即重新入池
  *
@@ -27,6 +28,9 @@
  *   GET  /healthz              公开: 全 proxy 状态/配额 (触发过期项探测)
  *   GET  /v1/models            聚合各 proxy 模型列表 (需 API_KEY)
  *   POST /v1/chat/completions  转发+选路+钉住+failover (需 API_KEY)
+ *   POST /v1/responses|/v1/messages|/v1/embeddings|/v1/messages/count_tokens
+ *                              转发+选路+failover (需 API_KEY); responses/messages
+ *                              的 stream:true 同 chat 一样豁免 CHAT_TIMEOUT_MS
  *   GET  /admin                管理后台 SPA (iOS 风格, 手机/桌面自适应)
  *   GET  /admin/api/overview   代理状态/统计/事件 (需 ADMIN_KEY 或 API_KEY)
  *   GET  /admin/api/config     脱敏配置
@@ -298,6 +302,12 @@ function blankState(p) {
     usagePct: 0,
     dailyLimit: 0,           // 日额度 (healthz DailyLimit, 供 /healthz 观测)
     messages24h: 0,          // 24h 已用消息数 (healthz Messages24h)
+    spendPct: 0,             // 日消费额度百分比 (healthz SpendPct, issue #122; 0 = 未设上限)
+    spendLimit: 0,           // MAX_SPEND_PER_DAY 建议上限 (ledger 单位)
+    spendDay: 0,             // 当前太平洋日消费桶 (healthz SpendDay)
+    spendLimited: 0,         // 上游 spend_limited 拒绝累计 (healthz SpendLimited)
+    mode: '',                // proxy 路由模式 (pooled | bridge | hybrid)
+    bridgeTokens: 0,         // bridge 模式缓存条目数 (healthz bridge_tokens)
     quota: {},               // model -> {limit, recentCount, resetAt, period}
     cooldownUntil: 0,
     resetAt: 0,              // 已知最早的额度重置时间 (ms)
@@ -373,10 +383,22 @@ function probeOnce(p, cfg) {
 
 // ─────────────────────────── healthz 探测 ───────────────────────────
 
-// 解析 proxy /healthz (tokens[0] = 该 proxy 唯一的 token)
+// 解析 proxy /healthz。pooled 模式取 tokens[0] (每实例 1 token); bridge/hybrid 模式
+// tokens 可能为空 (客户端自带 token, proxy 不持有额度视图) → 归一化为中性 score 50,
+// 不视为探测失败 (否则 bridge 实例会被永久标 unknown/probe_failed)。
 function parseHealthz(json, model) {
-  const t = Array.isArray(json.tokens) ? json.tokens[0] : null;
-  if (!t) return null;
+  const mode = String((json && json.mode) || '');
+  const bridgeTokens = Number((json && json.bridge_tokens)) || 0;
+  const t = Array.isArray(json && json.tokens) ? json.tokens[0] : null;
+  if (!t) {
+    return {
+      usagePct: 0, quota: {}, resetAt: 0, cooldownUntil: 0, score: 50,
+      dailyLimit: 0, messages24h: 0,
+      risk: '', sessionStatus: '',
+      spendPct: 0, spendLimit: 0, spendDay: 0, spendLimited: 0,
+      mode, bridgeTokens,
+    };
+  }
   const quota = {};
   let resetAt = 0;
   if (t.quota && typeof t.quota === 'object') {
@@ -397,9 +419,15 @@ function parseHealthz(json, model) {
   const usagePct = Number.isFinite(Number(t.UsagePct))
     ? Math.max(0, Math.min(100, Number(t.UsagePct)))
     : (dailyLimit > 0 ? Math.min(100, Math.round((messages24h / dailyLimit) * 100)) : 0);
+  // 日消费额度信号 (issue #122): 上游 $ 上限才是真正门槛, 按消息数算的 UsagePct 已弱化。
+  const spendLimit = Number(t.SpendLimit) || 0;
+  const spendDay = Number(t.SpendDay) || 0;
+  const spendPct = Number.isFinite(Number(t.SpendPct))
+    ? Math.max(0, Math.min(100, Number(t.SpendPct)))
+    : (spendLimit > 0 ? Math.min(100, Math.round((spendDay / spendLimit) * 100)) : 0);
   const mq = model && quota[model];
   const modelUsage = mq && mq.limit > 0 ? (mq.recentCount / mq.limit) * 100 : null;
-  let score = Math.max(usagePct, modelUsage === null ? 0 : modelUsage);
+  let score = Math.max(usagePct, spendPct, modelUsage === null ? 0 : modelUsage);
   // critical 风险账号降权但不剔除
   if (t.RiskLevel === 'critical') score = Math.max(score, 90);
   return {
@@ -407,6 +435,9 @@ function parseHealthz(json, model) {
     dailyLimit, messages24h,
     risk: t.RiskLevel || '',
     sessionStatus: t.SessionStatus || '',
+    spendPct, spendLimit, spendDay,
+    spendLimited: Number(t.SpendLimited) || 0,
+    mode, bridgeTokens,
   };
 }
 
@@ -421,6 +452,12 @@ function applyHealthz(st, h) {
   st.score = Math.round(h.score);
   st.risk = h.risk;
   st.sessionStatus = h.sessionStatus;
+  st.spendPct = h.spendPct || 0;
+  st.spendLimit = h.spendLimit || 0;
+  st.spendDay = h.spendDay || 0;
+  st.spendLimited = h.spendLimited || 0;
+  st.mode = h.mode || '';
+  st.bridgeTokens = h.bridgeTokens || 0;
 
   const now = nowMs();
   if (h.cooldownUntil > now) {
@@ -429,10 +466,12 @@ function applyHealthz(st, h) {
     st.detail = 'proxy token in cooldown until ' + new Date(h.cooldownUntil).toISOString();
     st.resetAt = h.cooldownUntil;
     st.nextProbe = h.cooldownUntil + 10 * 1000;
-  } else if (h.usagePct >= 100) {
+  } else if (h.usagePct >= 100 || h.spendPct >= 100) {
     st.status = 'depleted';
-    st.reason = 'daily_cap';
-    st.detail = 'daily message cap reached (usagePct=' + h.usagePct + ')';
+    st.reason = h.spendPct >= 100 ? 'spend_cap' : 'daily_cap';
+    st.detail = h.spendPct >= 100
+      ? 'daily spend cap reached (spendPct=' + h.spendPct + ')'
+      : 'daily message cap reached (usagePct=' + h.usagePct + ')';
     st.nextProbe = st.resetAt > now ? st.resetAt + 10 * 1000 : now + 300 * 1000;
   } else {
     // 逐模型检查会话额度
@@ -451,7 +490,7 @@ function applyHealthz(st, h) {
     } else {
       st.status = 'ok';
       st.reason = '';
-      st.detail = 'ok (usagePct=' + h.usagePct + ')';
+      st.detail = 'ok (usagePct=' + h.usagePct + ', spendPct=' + h.spendPct + ')';
       st.nextProbe = 0;
     }
   }
@@ -685,6 +724,9 @@ function extractResetMs(text, headerRetryAfter) {
     // 年份限 19xx/20xx: 排除 Go 零值 "0001-01-01T00:00:00Z" 之类无意义时间
     const mReset = text.match(/reset at\s+((?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]+(?:\.\d+)?(?:Z|[+-][0-9:]+))/i);
     if (mReset) reset = parseTs(mReset[1]);
+    // account_banned 的 BanError message: "resumes at <RFC3339>" (与 reset at 同构)
+    const mResume = text.match(/resumes at\s+((?:19|20)[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]+(?:\.\d+)?(?:Z|[+-][0-9:]+))/i);
+    if (mResume && !reset) reset = parseTs(mResume[1]);
     const mRetry = text.match(/retry after\s+([0-9]+)\s*s/i);
     if (mRetry && !retryAfterS) retryAfterS = parseInt(mRetry[1], 10);
   }
@@ -692,7 +734,15 @@ function extractResetMs(text, headerRetryAfter) {
   return { retryAfterS, reset };
 }
 
-// 读响应体并分类 (读 body 是为了提取 quota 细节; 非 2xx 才需要)
+// 读响应体并分类 (读 body 是为了提取 quota 细节; 非 2xx 才需要)。
+// 对齐 proxy 的 writeError 矩阵 (internal/server/server.go): 除 quota/banned/down/
+// surface/bad_config 外新增 "retry" 瞬时类 —— 上游队列/容量/出口 IP 的临时性拒绝,
+// 短退避 + failover, 但绝不把 proxy 标成 depleted (额度没耗尽)。
+const TRANSIENT_CODES = new Set([
+  'ip_capped', 'load_shedding', 'peak_hours', 'free_mode_capacity_deferred',
+  'session_limit_reached', 'model_ip_limited',
+  'waiting_room_queued', 'waiting_room_required', 'session_superseded', 'upstream_retryable',
+]);
 async function classify(resp) {
   const status = resp.status;
   if (status >= 200 && status < 300) return { kind: 'ok', resp, code: '' };
@@ -701,20 +751,33 @@ async function classify(resp) {
   try { const j = JSON.parse(text); code = (j.error && j.error.code) || ''; } catch (e) {}
   const { retryAfterS, reset } = extractResetMs(text, resp.headers.get('retry-after'));
   switch (status) {
-    case 429: return { kind: 'quota', resp, text, code, retryAfterS, reset };
+    case 429:
+      if (TRANSIENT_CODES.has(code)) return { kind: 'retry', resp, text, code, retryAfterS, reset };
+      return { kind: 'quota', resp, text, code, retryAfterS, reset };
     case 402: return { kind: 'quota', resp, text, code, retryAfterS, reset }; // out_of_credits
     case 403:
-      if (code === 'account_banned') return { kind: 'banned', resp, text, code };
+      if (code === 'account_banned') return { kind: 'banned', resp, text, code, retryAfterS, reset };
       if (code === 'free_mode_cli_required') return { kind: 'surface', resp, text, code };
       return { kind: 'down', resp, text, code }; // country_blocked 等
+    case 409:
+      // session_limit_reached / model_ip_limited: 账号并发/出口 IP 临时受限, 换 proxy 可能恢复
+      if (TRANSIENT_CODES.has(code)) return { kind: 'retry', resp, text, code, retryAfterS, reset };
+      return { kind: 'surface', resp, text, code };
+    case 503:
+      // waiting_room_*/session_superseded/upstream_retryable: 上游瞬时队列/接管, 短退避重试
+      if (TRANSIENT_CODES.has(code)) return { kind: 'retry', resp, text, code, retryAfterS, reset };
+      return { kind: 'down', resp, text, code };
     case 401: return { kind: 'bad_config', resp, text, code };
+    case 502:
+      if (code === 'upstream_auth_rejected') return { kind: 'bad_config', resp, text, code, retryAfterS, reset };
+      return { kind: 'down', resp, text, code };
     case 400:
     case 404: return { kind: 'surface', resp, text, code }; // 客户端错, 不 failover
     default:  return { kind: 'down', resp, text, code };    // 5xx 等
   }
 }
 
-// 一次失败后更新 proxy 状态 (kind: quota | banned | bad_config | down | surface)
+// 一次失败后更新 proxy 状态 (kind: quota | banned | retry | bad_config | down | surface)
 async function recordFailure(st, kind, cfg, extra) {
   // surface = 客户端请求错误 (400/404/free_mode_cli_required): 与 proxy 健康无关,
   // 不标记任何状态, 只计数。
@@ -742,9 +805,31 @@ async function recordFailure(st, kind, cfg, extra) {
     case 'banned':
       st.status = 'depleted';
       st.reason = 'banned';
-      st.backoff = Math.min(cfg.depletedProbe, Math.max(300, st.backoff * 2));
-      st.nextProbe = now + st.backoff * 1000 + jitter();
-      st.detail = 'account banned (403)';
+      st.retryAfter = extra.retryAfterS || 0;
+      if (extra.reset > now) st.resetAt = extra.reset;
+      if (extra.reset > now) {
+        st.nextProbe = extra.reset + 10 * 1000; // 对齐 resumes_at, 不再固定 >=300s
+      } else {
+        st.backoff = Math.min(cfg.depletedProbe, Math.max(300, st.backoff * 2));
+        st.nextProbe = now + st.backoff * 1000 + jitter();
+      }
+      st.detail = 'account banned (403)' + (extra.reset > now ? ', resumes at ' + new Date(extra.reset).toISOString() : '');
+      break;
+    case 'retry':
+      // 瞬时类上游拒绝 (ip_capped/load_shedding/peak_hours/waiting_room/session_superseded 等):
+      // 既非额度耗尽也非 proxy 挂 —— 短退避 + 对齐 Retry-After, 重放请求切下一 proxy。
+      st.status = 'down';
+      st.reason = extra.code || 'transient';
+      st.retryAfter = extra.retryAfterS || 0;
+      if (extra.reset > now) st.resetAt = extra.reset;
+      if (extra.reset > now) {
+        st.nextProbe = extra.reset + 10 * 1000;
+      } else {
+        const base = extra.retryAfterS > 0 ? Math.max(15, extra.retryAfterS) : cfg.downProbe;
+        st.backoff = Math.min(cfg.depletedProbe, base);
+        st.nextProbe = now + st.backoff * 1000 + jitter();
+      }
+      st.detail = (extra.code || 'transient') + ' from proxy (retryAfter=' + (extra.retryAfterS || '?') + 's)';
       break;
     case 'bad_config':
       st.status = 'bad_config';
@@ -845,6 +930,7 @@ function errorResponse(status, code, message, extra) {
 function aggregateError(attempts, cfg) {
   const quotas = attempts.filter(a => a.kind === 'quota');
   const banned = attempts.find(a => a.kind === 'banned');
+  const retries = attempts.filter(a => a.kind === 'retry');
   const badConfig = attempts.find(a => a.kind === 'bad_config');
   const surfaces = attempts.filter(a => a.kind === 'surface');
   if (surfaces.length) {
@@ -868,6 +954,17 @@ function aggregateError(attempts, cfg) {
       'All proxies are quota-exhausted: ' + names + '. Wait for quota reset or add another token.',
       { retryAfter: retryAfter || 60, hint: 'Daily/session quota reached. Retry after reset.' }) };
   }
+  if (retries.length) {
+    let retryAfter = 0;
+    for (const r of retries) {
+      const ra = r.retryAfterS || (r.reset ? Math.max(1, Math.ceil((r.reset - nowMs()) / 1000)) : 0);
+      if (ra > 0) retryAfter = retryAfter === 0 ? ra : Math.min(retryAfter, ra);
+    }
+    const names = [...new Set(retries.map(a => a.name))].join(', ');
+    return { error: errorResponse(503, 'upstream_retryable',
+      'All proxies report a transient upstream refusal (' + names + '): ' + (retries[0].code || 'transient'),
+      { retryAfter: retryAfter || 15, hint: 'Upstream queue/capacity/egress temporarily unavailable. Retry after the window.' }) };
+  }
   if (badConfig) {
     return { error: errorResponse(502, 'upstream_auth_rejected',
       'Proxy rejected gateway key (401): ' + badConfig.name + '. Check PROXIES apiKey config.',
@@ -888,7 +985,14 @@ async function routeRequest(req, cfg, body, opts = {}) {
   const sticky = opts.stickyKey !== undefined
     ? opts.stickyKey
     : (opts.noSticky ? null : stickyKeyFor(req, cfg));
-  const isChat = req.method === 'POST' && (url.pathname === '/v1/chat/completions');
+  // 流式端点: chat completions / responses / messages 都支持 stream:true。count_tokens/
+  // embeddings 等非流式端点走通用转发 (无 stream 检测)。把这些端点纳入 isChat 是为了让
+  // 流式请求同样豁免 CHAT_TIMEOUT_MS (否则 /v1/responses 的长流会被网关超时截断)。
+  const isChat = req.method === 'POST' && (
+    url.pathname === '/v1/chat/completions' ||
+    url.pathname === '/v1/responses' ||
+    url.pathname === '/v1/messages'
+  );
   // 判断是否流式请求: 只有缓冲的 JSON body 能可靠判断 (stream:true)。非 JSON 透传 body
   // (ReadableStream) 无法解析 → 按非流式处理, 超时窗口只覆盖响应头等待阶段, 不影响透传流。
   let chatStream = false;
@@ -1063,13 +1167,19 @@ async function handleModels(req, cfg) {
     if (r.status !== 'fulfilled') { log(cfg, 'warn', 'models fetch failed', { err: r.reason && r.reason.message }); continue; }
     for (const m of r.value.data) {
       const id = m.id;
-      const cur = byModel.get(id) || { id, ok: 0, statuses: {} };
+      const cur = byModel.get(id) || { id, ok: 0, statuses: {}, tiers: {} };
       if (r.value.ok) cur.ok++;
       cur.statuses[m.status || 'unknown'] = (cur.statuses[m.status || 'unknown'] || 0) + 1;
+      if (m.current_access_tier) cur.tiers[m.current_access_tier] = (cur.tiers[m.current_access_tier] || 0) + 1;
       byModel.set(id, cur);
     }
   }
   const created = Math.floor(Date.now() / 1000);
+  const mostCommon = (obj) => {
+    let best = '', n = -1;
+    for (const [k, v] of Object.entries(obj || {})) if (v > n) { n = v; best = k; }
+    return best;
+  };
   const data = [...byModel.values()].map(c => ({
     id: c.id,
     object: 'model',
@@ -1077,6 +1187,7 @@ async function handleModels(req, cfg) {
     owned_by: 'freebuff',
     available: c.ok > 0,
     status: c.ok > 0 ? 'available' : (c.statuses['quota_exhausted'] ? 'quota_exhausted' : 'unavailable'),
+    current_access_tier: mostCommon(c.tiers) || null,
   }));
   return new Response(JSON.stringify({ object: 'list', data }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
@@ -1375,6 +1486,12 @@ async function handleGatewayHealth(cfg) {
     last_ok: st.lastOk ? new Date(st.lastOk).toISOString() : null,
     last_error: st.lastError ? new Date(st.lastError).toISOString() : null,
     consecutive_errors: st.consecutiveErrors,
+    spend_pct: st.spendPct || null,
+    spend_limit: st.spendLimit || null,
+    spend_day: st.spendDay || null,
+    spend_limited: st.spendLimited || null,
+    mode: st.mode || null,
+    bridge_tokens: st.bridgeTokens || null,
     quota: Object.fromEntries(Object.entries(st.quota || {}).map(([m, q]) => [
       m, { limit: q.limit, recent_count: q.recentCount, reset_at: q.resetAt ? new Date(q.resetAt).toISOString() : null, period: q.period },
     ])),
@@ -1419,6 +1536,12 @@ async function adminOverview(cfg) {
     usage_pct: st.usagePct,
     daily_limit: st.dailyLimit || null,
     messages_24h: st.messages24h || null,
+    spend_pct: st.spendPct || null,
+    spend_limit: st.spendLimit || null,
+    spend_day: st.spendDay || null,
+    spend_limited: st.spendLimited || null,
+    mode: st.mode || null,
+    bridge_tokens: st.bridgeTokens || null,
     risk: st.risk || null,
     cooldown_until: st.cooldownUntil ? new Date(st.cooldownUntil).toISOString() : null,
     reset_at: st.resetAt ? new Date(st.resetAt).toISOString() : null,

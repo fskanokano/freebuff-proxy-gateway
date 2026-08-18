@@ -4,7 +4,7 @@
 
 - **按剩余额度选路** —— 读取各 proxy 的 `/healthz`（每日用量百分比 + 每模型会话额度 `recent/limit`），选余量最多的 proxy
 - **钉住路由 (sticky pin)** —— 同一客户端（或 `X-Sticky-Id` 会话）持续路由到当前 proxy，直到它额度耗尽，避免一个对话烧多个账号的额度
-- **带内失败切换** —— 收到 `429 rate_limited` / `402 out_of_credits` / `403 banned` / 5xx / 网络错误时，标记该 proxy 状态并**重放请求**切换到下一个 proxy
+- **带内失败切换** —— 收到 `429 rate_limited` / `402 out_of_credits` / `403 banned` / 5xx / 网络错误时，标记该 proxy 状态并**重放请求**切换到下一个 proxy；瞬时类上游拒绝（`ip_capped`/等待队列/容量延迟等）短退避换 proxy，**不误标额度耗尽**
 - **智能探测** —— 只在用户活跃使用、且仅对「当前常驻 / 即将使用的代理」探测 `/healthz`；空闲代理绝不探测（不白白消耗其额度）。depleted/down 仅在真正被使用或全耗尽时才懒探测恢复。如需无钉住时全量探测按余量选最优，可设 `PROBE_MODE=scan`（默认 `smart`）
 
 零依赖，免费计划可用。状态存 `caches.default`（跨 isolate 共享，最终一致——钉住偶尔过期只会导致一次请求换 proxy，自愈）。
@@ -48,7 +48,7 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 
 验证：`curl https://<proxy-url>/healthz` 应返回 `{"status":"ok","tokens":[{...,"UsagePct":0,...}]}`。
 
-> 额度信号说明：`/healthz` 的 `UsagePct` 是 proxy 侧 `MAX_MESSAGES_PER_DAY` 的滚动 24h 用量（未配置则为 0）；`quota.<model>.{limit,recent_count,reset_at}` 是 FreeBuff 会话额度（proxy 通过其内部零成本 GET 探测维护，≤60s 刷新一次）。两个信号网关都消费。
+> 额度信号说明：`/healthz` 的 `UsagePct` 是 proxy 侧 `MAX_MESSAGES_PER_DAY` 的滚动 24h 用量（未配置则为 0）；`SpendPct` 是 `MAX_SPEND_PER_DAY` 的太平洋日消费额度百分比（上游 `$` 上限才是真正门槛，建议配它以让 score 更贴近真实余量）；`quota.<model>.{limit,recent_count,reset_at}` 是 FreeBuff 会话额度（proxy 通过其内部零成本 GET 探测维护，≤60s 刷新一次）。三个信号网关都消费（score 取三者最大）。
 
 ## 部署网关
 
@@ -160,18 +160,20 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 
 **选路**（每次请求）：
 1. 钉住键（客户端 key 或 `X-Sticky-Id`）有 pin 且该 proxy 状态 ok → 直接用它
-2. 否则在 ok 的 proxy 里按 `score = max(UsagePct, 模型会话 recent/limit)` 升序选，平分按最近使用（LRU）
+2. 否则在 ok 的 proxy 里按 `score = max(UsagePct, SpendPct, 模型会话 recent/limit)` 升序选，平分按最近使用（LRU）
 3. 全部 depleted/down → 挑恢复时间最早的，对客户端返回 `429 rate_limited` + `Retry-After`（或 403 banned / 502）
 
 **失败分类与处置**（带内）：
 
 | 响应 | 判定 | 处置 |
 |---|---|---|
-| 429 rate_limited / 402 out_of_credits | depleted | 解析 `Retry-After`（秒数或 HTTP-date 均可）与 body 里 `reset at <RFC3339>`，`nextProbe = resetAt+10s`；reset 缺失/非法/在过去时回退指数退避（防止重探风暴）；重放请求切换 |
-| 403 account_banned | depleted(banned) | 长退避（≥300s） |
-| 403 country_blocked / 5xx / 网络错 | down | 指数退避 120→300s |
-| 非流式 chat 单次尝试超时（`CHAT_TIMEOUT_MS`，默认 120s） | down | 网关主动中止挂死（不响应）的尝试并 failover；流式不受限 |
+| 429 `rate_limited` / 402 `out_of_credits` | depleted | 解析 `Retry-After`（秒数或 HTTP-date 均可）与 body 里 `reset at <RFC3339>`，`nextProbe = resetAt+10s`；reset 缺失/非法/在过去时回退指数退避（防止重探风暴）；重放请求切换 |
+| 403 `account_banned` | depleted(banned) | 解析 body 里 `resumes at <RFC3339>`（或 `Retry-After`）对齐 `nextProbe = resumes+10s`；无时间时长退避（≥300s） |
+| 403 `country_blocked` | down | 区域限制（非 token 问题），指数退避 120→300s |
+| 429 `ip_capped`/`load_shedding`/`peak_hours`/`free_mode_capacity_deferred`、409 `session_limit_reached`/`model_ip_limited`、503 `waiting_room_*`/`session_superseded`/`upstream_retryable` | down（瞬时） | **瞬时类**：短退避对齐 `Retry-After`，failover 换 proxy，**不**标 depleted（额度没耗尽） |
+| 502 `upstream_auth_rejected` | bad_config | proxy 自身上游 token 失效，退避重试，最终 502 |
 | 401（proxy 拒绝网关 key） | bad_config | 退避重试，最终 502 提示检查 PROXIES 配置 |
+| 非流式 chat 单次尝试超时（`CHAT_TIMEOUT_MS`，默认 120s） | down | 网关主动中止挂死（不响应）的尝试并 failover；流式不受限 |
 | 400 / 404（客户端错） | — | 原样透传，**不** failover |
 
 **探测策略**（懒触发，无后台循环）：
@@ -182,7 +184,7 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 ## 限制与取舍
 
 - **状态最终一致**：`caches.default` 跨 isolate 共享但非强一致。极端情况（两个 isolate 同时把不同客户端钉到同一 proxy）只是加速消耗该 proxy 额度，不影响正确性
-- **额度是"信号"而非"计数"**：网关不精确扣减每次请求的额度，靠 healthz 刷新 + 带内 429/402 兜底。proxy 侧建议配 `MAX_MESSAGES_PER_DAY` 让 UsagePct 有参考价值
+- **额度是"信号"而非"计数"**：网关不精确扣减每次请求的额度，靠 healthz 刷新 + 带内 429/402 兜底。proxy 侧建议配 `MAX_MESSAGES_PER_DAY` 与 `MAX_SPEND_PER_DAY` 让 UsagePct/SpendPct 有参考价值
 - 请求体会被网关缓冲（≤32MB，json/text 类型）以支持 failover 重放；其余类型（multipart/octet-stream/ndjson 等）原样透传请求体流，但**不可重放**——首次尝试失败后不 failover，直接返回该次结果。透传分支不做缓冲，超限防护改为 **content-length 预检**（声明 >32MB 直接 413）；无长度（chunked）的流只能依赖边缘/上游限制
 - 非流式 chat 有单次尝试超时（`CHAT_TIMEOUT_MS`）；流式响应不做网关侧超时，挂起的流由客户端断开兜底（客户端取消会中止上游请求并返回 499，且不会把健康 proxy 误标 down）
 - 单 proxy 配了多个 token 也能用（healthz 只取 `tokens[0]`）——但建议按"1 proxy = 1 token"部署以让网关的额度视图精确
