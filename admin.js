@@ -271,6 +271,64 @@ button:active,.btn:active,.icon-btn:active,.side-item:active,.tab:active{transfo
   #view-settings.active>h2,#view-settings.active>.sub{grid-column:1/-1;margin-bottom:0}.field{margin-bottom:14px}
   .login{background:rgba(16,24,40,.45)}.login-card{border:1px solid rgba(255,255,255,.4)}
 }
+/* ── Dark theme completeness ──
+   The redesign introduces canvas/surface/ink tokens in addition to the
+   original Apple tokens. Override every new token and hard-coded light
+   surface so dark mode is a complete visual system, not dark cards on a
+   light page. */
+body.theme-dark{
+  --canvas:#000;
+  --ink:#f5f5f7;
+  --muted:#a1a1aa;
+  --line:#38383a;
+  --surface:#1c1c1e;
+  --surface-soft:#2c2c2e;
+  --accent:#0a84ff;
+  --accent-soft:rgba(10,132,255,.18);
+}
+body.theme-dark,
+body.theme-dark .app,
+body.theme-dark .content{background:var(--canvas);color:var(--ink)}
+body.theme-dark .nav{
+  background:rgba(28,28,30,.88);
+  border-bottom-color:rgba(235,235,245,.12);
+  color:var(--ink);
+}
+body.theme-dark .nav-title,
+body.theme-dark h2.section{color:var(--ink)}
+body.theme-dark .icon-btn{background:#2c2c2e;color:#f5f5f7}
+body.theme-dark .card,
+body.theme-dark .proxy,
+body.theme-dark .stat,
+body.theme-dark .pin-banner{
+  background:var(--surface);
+  border-color:rgba(235,235,245,.12);
+  box-shadow:0 2px 14px rgba(0,0,0,.28);
+}
+body.theme-dark .stat-label,
+body.theme-dark .sub,
+body.theme-dark .cell-label,
+body.theme-dark .event-desc,
+body.theme-dark .event-time{color:rgba(235,235,245,.62)}
+body.theme-dark .input{background:var(--surface-soft);border-color:#48484a;color:var(--ink)}
+body.theme-dark .btn.secondary{background:#2c2c2e;color:#64a8ff}
+body.theme-dark #evFilter{background:rgba(0,0,0,.88)}
+body.theme-dark .side-item{color:#98989d}
+body.theme-dark .side-item.active{color:#fff;background:#0a84ff}
+body.theme-dark .event{border-top-color:rgba(84,84,88,.55)}
+body.theme-dark .pin-banner .pin-sub{color:rgba(235,235,245,.56)}
+@media (max-width:767px){
+  body.theme-dark .nav{background:rgba(28,28,30,.9)}
+  body.theme-dark .icon-btn{background:#2c2c2e}
+  body.theme-dark .input{background:#2c2c2e;border-color:#48484a}
+  body.theme-dark #evFilter{background:rgba(0,0,0,.9)}
+}
+@media (min-width:1024px){
+  body.theme-dark{--canvas:#000;--surface:#1c1c1e;--surface-soft:#2c2c2e;--line:#38383a}
+  body.theme-dark .nav{background:#1c1c1e;border-bottom-color:#38383a}
+  body.theme-dark .sidebar{background:#0b0b0d}
+  body.theme-dark .content{background:#000}
+}
 
 </style>
 </head>
