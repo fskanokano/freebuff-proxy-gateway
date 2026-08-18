@@ -9,5 +9,13 @@
   // 不注入任何 vars: 默认值已内置于代码 (parseEnv DEFAULTS),
   // 避免 wrangler 部署时用仓库 vars 覆盖用户在 Variables & Secrets 里的配置。
   // keep_vars 保证 dashboard 手动添加的变量不被部署删除。
-  "keep_vars": true
+  "keep_vars": true,
+  "durable_objects": {
+    "bindings": [
+      { "name": "GATEWAY_CONTROL", "class_name": "GatewayControl" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1-gateway-control", "new_sqlite_classes": ["GatewayControl"] }
+  ]
 }

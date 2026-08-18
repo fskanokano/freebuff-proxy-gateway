@@ -38,6 +38,7 @@
 'use strict';
 
 import { ADMIN_HTML } from './admin.js';
+import { GatewayControl } from './control.js';
 
 // ─────────────────────────── 配置解析 ───────────────────────────
 
@@ -72,6 +73,65 @@ function splitList(v) {
 
 // 构建版本标识: 仅注入响应头 X-GW-Build 供排查部署版本 (不显示在界面)
 const GW_BUILD = 'bb2b565';
+
+function controlStub(env) {
+  try {
+    if (!env || !env.GATEWAY_CONTROL) return null;
+    const id = env.GATEWAY_CONTROL.idFromName('global');
+    return env.GATEWAY_CONTROL.get(id);
+  } catch (e) { return null; }
+}
+
+// Compatibility contract: absent/broken DO binding never throws. Callers
+// fall back to the legacy cache path until the binding is available.
+async function controlGet(env, key) {
+  const stub = controlStub(env);
+  if (!stub) return undefined;
+  try {
+    const r = await stub.fetch('https://control/get?key=' + encodeURIComponent(key));
+    if (!r.ok) return undefined;
+    const j = await r.json();
+    return j.found ? j.value : null;
+  } catch (e) { return undefined; }
+}
+
+async function controlPut(env, key, value, ttl) {
+  const stub = controlStub(env);
+  if (!stub) return false;
+  try {
+    const r = await stub.fetch('https://control/put?key=' + encodeURIComponent(key), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value, ttl }) });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+async function controlDelete(env, key) {
+  const stub = controlStub(env);
+  if (!stub) return false;
+  try {
+    const r = await stub.fetch('https://control/delete?key=' + encodeURIComponent(key), { method: 'DELETE' });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+async function controlAppend(env, key, item, max, ttl) {
+  const stub = controlStub(env);
+  if (!stub) return false;
+  try {
+    const r = await stub.fetch('https://control/append?key=' + encodeURIComponent(key), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item, max, ttl }) });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+async function controlList(env, key, max) {
+  const stub = controlStub(env);
+  if (!stub) return null;
+  try {
+    const r = await stub.fetch('https://control/list?key=' + encodeURIComponent(key) + '&max=' + encodeURIComponent(max || 200));
+    if (!r.ok) return null;
+    const j = await r.json();
+    return Array.isArray(j.value) ? j.value : [];
+  } catch (e) { return null; }
+}
 
 function parseEnv(env) {
   const cfg = { ...DEFAULTS };
@@ -188,10 +248,17 @@ function pinKey(sticky) { return CACHE_ORIGIN + '/pin/' + hashKey(sticky); }
 function lastUsedKey(name, url) { return CACHE_ORIGIN + '/lastused/' + encodeURIComponent(name) + '/' + hashKey(url); }
 
 // 记录一次成功路由 (幂等累加计数)
-async function recordLastUsed(name, url) {
+async function recordLastUsed(name, url, cfg) {
+  const key = 'lastused:' + name + '|' + hashKey(url);
   try {
-    const r = await caches.default.get(lastUsedKey(name, url));
     let n = 1;
+    const controlled = cfg && cfg.env ? await controlGet(cfg.env, key) : undefined;
+    if (controlled !== undefined) {
+      n = (controlled.requestsOk || 0) + 1;
+      await controlPut(cfg.env, key, { at: nowMs(), requestsOk: n }, 3600);
+      return;
+    }
+    const r = await caches.default.get(lastUsedKey(name, url));
     if (r) { try { const j = await r.json(); n = (j.requestsOk || 0) + 1; } catch (e) {} }
     await caches.default.put(lastUsedKey(name, url), new Response(JSON.stringify({ at: nowMs(), requestsOk: n }), {
       headers: { 'Content-Type': 'application/json' },
@@ -478,6 +545,8 @@ function stickyKeyFor(req, cfg) {
 
 async function getPin(sticky, cfg) {
   try {
+    const controlled = await controlGet(cfg.env, 'pin:' + sticky);
+    if (controlled !== undefined) return controlled && controlled.proxy ? controlled.proxy : null;
     const r = await caches.default.get(pinKey(sticky));
     if (!r) return null;
     const j = await r.json();
@@ -487,6 +556,8 @@ async function getPin(sticky, cfg) {
 
 async function setPin(sticky, proxyName, cfg) {
   try {
+    const stored = await controlPut(cfg.env, 'pin:' + sticky, { proxy: proxyName, at: nowMs() }, cfg.pinTtl);
+    if (stored) return;
     const resp = new Response(JSON.stringify({ proxy: proxyName, at: nowMs() }), {
       headers: { 'Content-Type': 'application/json' },
     });
@@ -501,7 +572,7 @@ async function buildCandidates(cfg, model, sticky) {
   const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, { model })));
   // 维护模式: 排除维护中的 proxy (双通道: 独立 key + state.maint 标记)。
   // 用 index 关联, 不在状态对象上打临时标记。
-  const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url)));
+  const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url, cfg)));
   const usable = (s, i) => !maint[i] && !s.maint;
   const ok = states.filter((s, i) => usable(s, i) && s.status === 'ok');
   const unknown = states.filter((s, i) => usable(s, i) && s.status === 'unknown');
@@ -845,7 +916,7 @@ async function routeRequest(req, cfg, body, opts = {}) {
       st.backoff = 60;
       st.nextProbe = 0;
       await putState(st, cfg);
-      await recordLastUsed(st.name, st.url); // 最近路由持久化 (独立 TTL, 跨 isolate 可见)
+      await recordLastUsed(st.name, st.url, cfg); // 最近路由持久化 (独立 TTL, 跨 isolate 可见)
       if (sticky) await setPin(sticky, st.name, cfg);
       attempts.push(cl);
       log(cfg, 'debug', 'relayed', { name: st.name, status: cl.resp.status, ms: cl.ms, sticky: !!sticky });
@@ -978,29 +1049,40 @@ function queueRoute(cfg, detail, waitUntil) {
 
 async function flushRoutes(cfg) {
   if (ROUTE_L1.length === 0) return;
-  // 先复制, 写入成功后再从 L1 删除; 写失败则保留, 后续请求/后台读取可重试。
   const batch = ROUTE_L1.slice();
+  let wrote = false;
   try {
-    let list = [];
-    const r = await caches.default.get(ROUTES_KEY);
-    if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
-    list = [...list, ...batch];
-    if (list.length > MAX_ROUTES) list = list.slice(list.length - MAX_ROUTES);
-    await caches.default.put(ROUTES_KEY, new Response(JSON.stringify(list), {
-      headers: { 'Content-Type': 'application/json' },
-    }), { ttl: 86400 });
-    // 只移除本次写入的前缀; 写入期间新到的记录保留给下一轮。
-    ROUTE_L1.splice(0, batch.length);
+    if (cfg.env) {
+      const ok = await controlAppend(cfg.env, 'routes', batch, MAX_ROUTES, 86400);
+      if (ok) { ROUTE_L1.splice(0, batch.length); wrote = true; }
+    }
+    if (!wrote) {
+      let list = [];
+      const r = await caches.default.get(ROUTES_KEY);
+      if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
+      list = [...list, ...batch];
+      if (list.length > MAX_ROUTES) list = list.slice(list.length - MAX_ROUTES);
+      await caches.default.put(ROUTES_KEY, new Response(JSON.stringify(list), {
+        headers: { 'Content-Type': 'application/json' },
+      }), { ttl: 86400 });
+      ROUTE_L1.splice(0, batch.length);
+      wrote = true;
+    }
+    if (!wrote) { /* both unavailable: keep batch for later */ }
   } catch (e) {
     // 保留 batch, 不能因一次 Cache API 暂时失败丢掉路由记录
     throw e;
   }
 }
 
-async function readRoutes() {
+async function readRoutes(cfg) {
   try {
-    await routeFlushChain;   // 等本 isolate 未完成的落盘先写完, 避免读到旧列表
-    await flushRoutes({});   // 把 L1 剩余累积写入
+    await routeFlushChain;   // 等本 isolate 未完成的落盘先写完
+    await flushRoutes(cfg);  // 把 L1 剩余累积写入
+    if (cfg.env) {
+      const controlled = await controlList(cfg.env, 'routes', MAX_ROUTES);
+      if (controlled !== null) return controlled;
+    }
     const r = await caches.default.get(ROUTES_KEY);
     if (!r) return [];
     const j = await r.json();
@@ -1024,23 +1106,35 @@ function pushEvent(cfg, type, detail) {
 
 async function flushEvents(cfg) {
   if (EVENT_L1.length === 0) return;
-  const batch = EVENT_L1.splice(0);
+  const batch = EVENT_L1.slice();
+  let wrote = false;
   try {
-    let list = [];
-    const r = await caches.default.get(EVENTS_KEY);
-    if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
-    list = [...list, ...batch];
-    if (list.length > MAX_EVENTS) list = list.slice(list.length - MAX_EVENTS);
-    await caches.default.put(EVENTS_KEY, new Response(JSON.stringify(list), {
-      headers: { 'Content-Type': 'application/json' },
-    }), { ttl: 86400 });
-  } catch (e) { /* 尽力而为 */ }
+    if (cfg.env) {
+      const ok = await controlAppend(cfg.env, 'events', batch, MAX_EVENTS, 86400);
+      if (ok) { EVENT_L1.splice(0, batch.length); wrote = true; }
+    }
+    if (!wrote) {
+      let list = [];
+      const r = await caches.default.get(EVENTS_KEY);
+      if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
+      list = [...list, ...batch];
+      if (list.length > MAX_EVENTS) list = list.slice(list.length - MAX_EVENTS);
+      await caches.default.put(EVENTS_KEY, new Response(JSON.stringify(list), {
+        headers: { 'Content-Type': 'application/json' },
+      }), { ttl: 86400 });
+      EVENT_L1.splice(0, batch.length);
+    }
+  } catch (e) { /* 保留 batch, 稍后重试 */ }
 }
 
-async function readEvents() {
+async function readEvents(cfg) {
   try {
     await eventFlushChain;   // 等本 isolate 未完成的落盘先写完
-    await flushEvents({});   // 把 L1 剩余累积写进去
+    await flushEvents(cfg);  // 把 L1 剩余累积写进去
+    if (cfg.env) {
+      const controlled = await controlList(cfg.env, 'events', MAX_EVENTS);
+      if (controlled !== null) return controlled;
+    }
     const r = await caches.default.get(EVENTS_KEY);
     if (!r) return [];
     const j = await r.json();
@@ -1052,8 +1146,12 @@ async function readEvents() {
 
 function maintKey(name, url) { return CACHE_ORIGIN + '/maint/' + encodeURIComponent(name) + '/' + hashKey(url); }
 
-async function isMaintenance(name, url) {
+async function isMaintenance(name, url, cfg) {
   try {
+    if (cfg && cfg.env) {
+      const c = await controlGet(cfg.env, 'maint:' + name + '|' + hashKey(url));
+      if (c !== undefined) return !!(c && c.on);
+    }
     const r = await caches.default.get(maintKey(name, url));
     if (!r) return false;
     const j = await r.json();
@@ -1065,6 +1163,32 @@ async function isMaintenance(name, url) {
 // (每次路由都会读 state, 同边缘内立即生效; state 的 L1 缓存让同 isolate 即刻排除)。
 async function setMaintenance(name, url, on, cfg) {
   try {
+    const key = 'maint:' + name + '|' + hashKey(url);
+    if (cfg.env) {
+      const ok = on ? await controlPut(cfg.env, key, { on: true, at: nowMs() }, 86400)
+                    : await controlDelete(cfg.env, key);
+      if (ok) {
+        const p = cfg.proxies.find(x => x.name === name && x.url === url);
+        if (p) {
+          const st = (l1Get(p.name, p.url)) || blankState(p);
+          st.maint = on;
+          st.maintChangedAt = nowMs();
+          if (on) {
+            st.status = 'down';
+            st.reason = 'maintenance';
+            st.detail = 'manual maintenance mode';
+            await putState(st, cfg);
+          } else {
+            st.status = 'unknown';
+            st.reason = '';
+            st.detail = '';
+            await putState(st, cfg);
+            await doProbe(p, cfg);
+          }
+        }
+        return;
+      }
+    }
     if (on) {
       await caches.default.put(maintKey(name, url), new Response(JSON.stringify({ on: true, at: nowMs() }), {
         headers: { 'Content-Type': 'application/json' },
@@ -1101,8 +1225,10 @@ async function setMaintenance(name, url, on, cfg) {
 // 存 caches.default, TTL 30 天; 每次请求加载时应用; 可"重置为环境变量"。
 const RUNTIME_KEY = CACHE_ORIGIN + '/runtime-config';
 
-async function getRuntimeConfig() {
+async function getRuntimeConfig(env) {
   try {
+    const controlled = await controlGet(env, 'runtime-config');
+    if (controlled !== undefined) return controlled;
     const r = await caches.default.get(RUNTIME_KEY);
     if (!r) return null;
     const j = await r.json();
@@ -1110,20 +1236,24 @@ async function getRuntimeConfig() {
   } catch (e) { return null; }
 }
 
-async function setRuntimeConfig(rc) {
+async function setRuntimeConfig(env, rc) {
+  const stored = await controlPut(env, 'runtime-config', rc, 2592000);
+  if (stored) return;
   await caches.default.put(RUNTIME_KEY, new Response(JSON.stringify(rc), {
     headers: { 'Content-Type': 'application/json' },
-  }), { ttl: 2592000 }); // 30 天
+  }), { ttl: 2592000 });
 }
 
-async function clearRuntimeConfig() {
+async function clearRuntimeConfig(env) {
+  const deleted = await controlDelete(env, 'runtime-config');
+  if (deleted) return;
   await caches.default.delete(RUNTIME_KEY);
 }
 
 // 环境变量为基础配置, 叠加运行时覆盖。返回新的 cfg。
 // 重要: 运行时配置校验失败时降级忽略 (继续用环境变量), 绝不因脏数据让 worker 不可用。
 async function applyRuntimeConfig(cfg) {
-  const rc = await getRuntimeConfig();
+  const rc = await getRuntimeConfig(cfg.env);
   if (!rc) return cfg;
   cfg._runtime = rc;
   if (Array.isArray(rc.proxies) && rc.proxies.length > 0) {
@@ -1214,7 +1344,7 @@ function maskKey(k) {
 // 汇总 overview: 各 proxy 状态 + 统计 + 维护状态 + 事件
 async function adminOverview(cfg) {
   const states = await Promise.all(cfg.proxies.map(p => ensureFresh(p, cfg, {})));
-  const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url)));
+  const maint = await Promise.all(cfg.proxies.map(p => isMaintenance(p.name, p.url, cfg)));
   const proxies = states.map((st, i) => {
     const isMaint = !!maint[i] || !!st.maint;
     return {
@@ -1251,8 +1381,8 @@ async function adminOverview(cfg) {
     requestsOk: proxies.reduce((a, p) => a + p.requestsOk, 0),
     requestsFail: proxies.reduce((a, p) => a + p.requestsFail, 0),
   };
-  const events = await readEvents();
-  const routes = await readRoutes();
+  const events = await readEvents(cfg);
+  const routes = await readRoutes(cfg);
   return new Response(JSON.stringify({ status: 'ok', stats, proxies, events, routes, timestamp: new Date().toISOString() }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
   });
@@ -1290,7 +1420,7 @@ async function adminSaveConfig(req, cfg) {
   try { body = await req.json(); } catch (e) { return errorResponse(400, 'invalid_config', 'invalid JSON body', {}); }
   // 读-改-写合并: 后台"保存代理"与"保存参数"是两个独立表单, 各只 POST 自己的字段。
   // 若整体替换会把另一部分清掉 (先存代理、再只改一个参数 → 代理列表静默回退环境变量)。
-  const rc = { ...((await getRuntimeConfig()) || {}) };
+  const rc = { ...((await getRuntimeConfig(cfg.env)) || {}) };
   if (body.proxies !== undefined) {
     if (!Array.isArray(body.proxies) || body.proxies.length === 0) {
       return errorResponse(400, 'invalid_config', 'proxies must be a non-empty array of {name?,url,apiKey}', {});
@@ -1338,7 +1468,7 @@ async function adminSaveConfig(req, cfg) {
     rc.settings = merged;
   }
   if (!rc.proxies && !rc.settings) return errorResponse(400, 'invalid_config', 'nothing to save (provide proxies and/or settings)', {});
-  await setRuntimeConfig(rc);
+  await setRuntimeConfig(cfg.env, rc);
   pushEvent(cfg, 'admin_action', {
     action: 'save_config',
     proxies: rc.proxies ? rc.proxies.length : null,
@@ -1351,7 +1481,7 @@ async function adminSaveConfig(req, cfg) {
 
 // 清除运行时配置, 回到环境变量
 async function adminResetConfig(cfg) {
-  await clearRuntimeConfig();
+  await clearRuntimeConfig(cfg.env);
   pushEvent(cfg, 'admin_action', { action: 'reset_config' });
   return new Response(JSON.stringify({ reset: true, note: '已清除运行时配置, 恢复为环境变量' }), {
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
@@ -1415,9 +1545,20 @@ async function adminPinStatus(req, cfg) {
   const recent = [];
   for (const p of cfg.proxies) {
     let lu = null;
+    const key = 'lastused:' + p.name + '|' + hashKey(p.url);
     try {
-      const r = await caches.default.get(lastUsedKey(p.name, p.url));
-      if (r) { const j = await r.json(); if (j && j.at > 0) lu = { at: j.at, requestsOk: j.requestsOk || 0 }; }
+      if (cfg.env) {
+        const c = await controlGet(cfg.env, key);
+        if (c !== undefined) {
+          if (c.at > 0) lu = { at: c.at, requestsOk: c.requestsOk || 0 };
+        } else {
+          const r = await caches.default.get(lastUsedKey(p.name, p.url));
+          if (r) { const j = await r.json(); if (j && j.at > 0) lu = { at: j.at, requestsOk: j.requestsOk || 0 }; }
+        }
+      } else {
+        const r = await caches.default.get(lastUsedKey(p.name, p.url));
+        if (r) { const j = await r.json(); if (j && j.at > 0) lu = { at: j.at, requestsOk: j.requestsOk || 0 }; }
+      }
     } catch (e) {}
     if (lu) {
       recent.push({ name: p.name, lastUsed: lu.at, requestsOk: lu.requestsOk });
@@ -1543,13 +1684,19 @@ function adminAuthorized(req, cfg) {
 
 // ─────────────────────────── 入口 ───────────────────────────
 
+export { GatewayControl };
+
 export default {
   async fetch(request, env, ctx) {
+    // Compatibility context: all config/control helpers can use the current
+    // request env without changing every legacy helper signature.
+    globalThis.__GW_ENV = env;
     const url = new URL(request.url);
     let cfg;
     try {
       cfg = parseEnv(env);
-      cfg = await applyRuntimeConfig(cfg); // 运行时配置覆盖环境变量 (用户后台改动优先)
+      cfg.env = env; // controls compatibility layer can detect optional binding
+      cfg = await applyRuntimeConfig(cfg);
     }
     catch (e) {
       // 诊断辅助: 回显"当前运行时实际收到的环境变量名" (只列名不列值, 不含系统注入的)
@@ -1567,7 +1714,7 @@ export default {
         });
       }
       if (url.pathname === '/admin/api/config/reset' && request.method === 'POST') {
-        try { await clearRuntimeConfig(); } catch (e2) {}
+        try { await clearRuntimeConfig(env); } catch (e2) {}
         return new Response(JSON.stringify({ reset: true, note: '已清除运行时配置, 请重新加载页面' }), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders() },
         });
