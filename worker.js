@@ -71,7 +71,7 @@ function splitList(v) {
 }
 
 // 构建版本标识: 仅注入响应头 X-GW-Build 供排查部署版本 (不显示在界面)
-const GW_BUILD = 'cb98c25';
+const GW_BUILD = 'f6df98b';
 
 function parseEnv(env) {
   const cfg = { ...DEFAULTS };
