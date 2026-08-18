@@ -1246,13 +1246,11 @@ async function handleModels(req, cfg) {
 const ROUTES_KEY = CACHE_ORIGIN + '/routes';
 const MAX_ROUTES = 200;
 const ROUTE_L1 = [];
-let routeFlushChain = Promise.resolve(); // 串行化同 isolate 落盘, 防并发覆盖丢条目
+let routeFlush = null; // 当前 in-flight 落盘 promise (合并写: 并发调用复用同一个, 取代无限 promise 链)
 
 function pushRoute(cfg, detail) {
   ROUTE_L1.push({ t: nowMs(), ...detail });
-  // 每推必落盘; 返回 promise 供 fetch(ctx).waitUntil 托管到响应结束后。
-  routeFlushChain = routeFlushChain.then(() => flushRoutes(cfg)).catch(() => {});
-  return routeFlushChain;
+  return flushRoutes(cfg).catch(() => false);
 }
 
 function queueRoute(cfg, detail, waitUntil) {
@@ -1261,16 +1259,19 @@ function queueRoute(cfg, detail, waitUntil) {
   return task;
 }
 
+// 合并式落盘: 若已有 in-flight flush 则复用(await 同一个, 最多等一次 DO 超时)。
+// 关键: 读路径不再 await 一个随流量无限增长的 promise 链 —— 后台接口不会在 DO 繁忙时被写日志的队列卡死。
 async function flushRoutes(cfg) {
-  if (ROUTE_L1.length === 0) return;
-  const batch = ROUTE_L1.slice();
-  let wrote = false;
-  try {
-    if (cfg.env) {
-      const ok = await controlAppend(cfg.env, 'routes', batch, MAX_ROUTES, cfg.logTtl);
-      if (ok) { ROUTE_L1.splice(0, batch.length); wrote = true; }
-    }
-    if (!wrote) {
+  if (routeFlush) return routeFlush;
+  if (ROUTE_L1.length === 0) return false;
+  routeFlush = (async () => {
+    const batch = ROUTE_L1.splice(0, ROUTE_L1.length); // 原子取走全部, 避免 slice+splice 并发竞态
+    try {
+      if (cfg.env) {
+        const ok = await controlAppend(cfg.env, 'routes', batch, MAX_ROUTES, cfg.logTtl);
+        if (ok) return true;
+      }
+      // DO 不可用/超时: 回退 cache (最后写者胜)
       let list = [];
       const r = await caches.default.get(ROUTES_KEY);
       if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
@@ -1279,22 +1280,22 @@ async function flushRoutes(cfg) {
       await caches.default.put(ROUTES_KEY, new Response(JSON.stringify(list), {
         headers: { 'Content-Type': 'application/json' },
       }), { ttl: cfg.logTtl });
-      ROUTE_L1.splice(0, batch.length);
-      wrote = true;
+      return true;
+    } catch (e) {
+      ROUTE_L1.unshift(...batch); // 失败回滚到队头, 稍后重试, 不丢
+      return false;
     }
-    if (!wrote) { /* both unavailable: keep batch for later */ }
-  } catch (e) {
-    // 保留 batch, 不能因一次 Cache API 暂时失败丢掉路由记录
-    throw e;
+  })();
+  try {
+    return await routeFlush;
+  } finally {
+    routeFlush = null;
   }
 }
 
 async function readRoutes(cfg) {
   try {
-    // 先落盘再读: 保证跨 isolate 的 pending 路由也能被看到 (pushRoute 已 waitUntil, 但读侧仍要 flush 本 isolate 的 L1)。
-    // 现在 controlAppend/controlList 都带 CONTROL_TIMEOUT_MS 超时, 读路径最多卡 3s 即降级, 不会再无限挂起。
-    await routeFlushChain;   // 等本 isolate 未完成的落盘先写完
-    await flushRoutes(cfg);  // 把 L1 剩余累积写入
+    await flushRoutes(cfg); // 合并式 flush: 最多等一次 DO 超时, 不阻塞在历史写链上
     if (cfg.env) {
       const controlled = await controlList(cfg.env, 'routes', MAX_ROUTES);
       if (controlled !== null) return controlled;
@@ -1311,25 +1312,26 @@ async function readRoutes(cfg) {
 const EVENTS_KEY = CACHE_ORIGIN + '/events';
 const MAX_EVENTS = 200;
 const EVENT_L1 = []; // isolate 内聚合
-let eventFlushChain = Promise.resolve(); // 串行化同 isolate 落盘
+let eventFlush = null; // 当前 in-flight 落盘 promise (合并写, 取代无限 promise 链)
 
-// 记录一条管理/运行事件 (尽力而为: cache 环形缓冲, 跨 isolate 最后写者胜)
-// 每推必落盘: 攒批 >=10 才 flush 会让低流量时的日志滞留本 isolate, 管理后台看不到
+// 记录一条管理/运行事件。用 cfg._waitUntil 托管落盘, 保证跨 isolate 可见 (否则后台读不到别处产生的事件)。
 function pushEvent(cfg, type, detail) {
   EVENT_L1.push({ t: nowMs(), type, ...detail });
-  eventFlushChain = eventFlushChain.then(() => flushEvents(cfg)).catch(() => {});
+  const task = flushEvents(cfg).catch(() => false);
+  if (cfg && typeof cfg._waitUntil === 'function') cfg._waitUntil(task);
 }
 
+// 合并式落盘: 并发调用复用同一个 in-flight flush, 最多等一次 DO 超时
 async function flushEvents(cfg) {
-  if (EVENT_L1.length === 0) return;
-  const batch = EVENT_L1.slice();
-  let wrote = false;
-  try {
-    if (cfg.env) {
-      const ok = await controlAppend(cfg.env, 'events', batch, MAX_EVENTS, cfg.logTtl);
-      if (ok) { EVENT_L1.splice(0, batch.length); wrote = true; }
-    }
-    if (!wrote) {
+  if (eventFlush) return eventFlush;
+  if (EVENT_L1.length === 0) return false;
+  eventFlush = (async () => {
+    const batch = EVENT_L1.splice(0, EVENT_L1.length); // 原子取走全部
+    try {
+      if (cfg.env) {
+        const ok = await controlAppend(cfg.env, 'events', batch, MAX_EVENTS, cfg.logTtl);
+        if (ok) return true;
+      }
       let list = [];
       const r = await caches.default.get(EVENTS_KEY);
       if (r) { const j = await r.json(); if (Array.isArray(j)) list = j; }
@@ -1338,17 +1340,22 @@ async function flushEvents(cfg) {
       await caches.default.put(EVENTS_KEY, new Response(JSON.stringify(list), {
         headers: { 'Content-Type': 'application/json' },
       }), { ttl: cfg.logTtl });
-      EVENT_L1.splice(0, batch.length);
+      return true;
+    } catch (e) {
+      EVENT_L1.unshift(...batch); // 失败回滚, 稍后重试
+      return false;
     }
-  } catch (e) { /* 保留 batch, 稍后重试 */ }
+  })();
+  try {
+    return await eventFlush;
+  } finally {
+    eventFlush = null;
+  }
 }
 
 async function readEvents(cfg) {
   try {
-    // 先落盘再读 (pushEvent 未 waitUntil, 只能靠读侧 flush 兜底跨 isolate 可见性);
-    // 有 CONTROL_TIMEOUT_MS 兜底, 不会因 DO 繁忙无限卡住。
-    await eventFlushChain;   // 等本 isolate 未完成的落盘先写完
-    await flushEvents(cfg);  // 把 L1 剩余累积写进去
+    await flushEvents(cfg); // 合并式 flush: 最多等一次 DO 超时, 不阻塞在历史写链上
     if (cfg.env) {
       const controlled = await controlList(cfg.env, 'events', MAX_EVENTS);
       if (controlled !== null) return controlled;
@@ -1796,9 +1803,8 @@ async function adminPinStatus(req, cfg) {
   let pinned = null;
   if (sticky) pinned = await getPin(sticky, cfg);
   // 最近路由事实: 优先读持久化的 last-used 记录 (TTL 1h, 不随状态过期丢失),
-  // fallback 到状态里的 lastUsed。
-  const recent = [];
-  for (const p of cfg.proxies) {
+  // fallback 到状态里的 lastUsed。并行读取: 串行 for 会在 DO 繁忙时 N×超时把后台卡死。
+  const recent = (await Promise.all(cfg.proxies.map(async (p) => {
     let lu = null;
     const key = 'lastused:' + p.name + '|' + hashKey(p.url);
     try {
@@ -1815,13 +1821,11 @@ async function adminPinStatus(req, cfg) {
         if (r) { const j = await r.json(); if (j && j.at > 0) lu = { at: j.at, requestsOk: j.requestsOk || 0 }; }
       }
     } catch (e) {}
-    if (lu) {
-      recent.push({ name: p.name, lastUsed: lu.at, requestsOk: lu.requestsOk });
-    } else {
-      const st = await getState(p, cfg);
-      if (st && st.lastUsed > 0) recent.push({ name: p.name, lastUsed: st.lastUsed, requestsOk: st.requestsOk || 0 });
-    }
-  }
+    if (lu) return { name: p.name, lastUsed: lu.at, requestsOk: lu.requestsOk };
+    const st = await getState(p, cfg);
+    if (st && st.lastUsed > 0) return { name: p.name, lastUsed: st.lastUsed, requestsOk: st.requestsOk || 0 };
+    return null;
+  }))).filter(Boolean);
   recent.sort((a, b) => b.lastUsed - a.lastUsed);
   return new Response(JSON.stringify({
     pin_mode: cfg.pinMode,
@@ -1951,6 +1955,9 @@ export default {
     try {
       cfg = parseEnv(env);
       cfg.env = env; // controls compatibility layer can detect optional binding
+      // 每请求的 waitUntil: 让 fire-and-forget 的日志落盘 (pushEvent) 能被托管到响应结束后,
+      // 保证跨 isolate 可见 (否则后台读不到别处产生的事件)。
+      cfg._waitUntil = ctx && typeof ctx.waitUntil === 'function' ? ctx.waitUntil.bind(ctx) : null;
       cfg = await applyRuntimeConfig(cfg);
     }
     catch (e) {
