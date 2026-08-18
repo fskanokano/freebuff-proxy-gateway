@@ -1023,17 +1023,20 @@ function cycleTheme(){
     api("/overview").then(function(d){hideLogin();updateDot(d);renderCurrent()}).catch(function(){showLogin("")});
   }else showLogin("");
   // 自动轮询: 更新状态灯 + 刷新当前视图 (test/settings 由交互触发, 不强制轮询)
+  var _polling=false;
   state.timer=setInterval(function(){
     if(!state.key||$("#login").classList.contains("show"))return;
+    if(_polling)return; // 上一轮轮询未返回则跳过, 防止慢请求堆积放大 DO 压力
     // 维护开关操作后短暂暂停代理页重绘, 避免旧数据把刚切换的开关弹回去
     if(state.view==="proxies"&&state.skipProxyRefreshUntil&&Date.now()<state.skipProxyRefreshUntil)return;
     if(state.view==="events"&&!state.logLive)return; // 日志页暂停自动刷新
+    _polling=true;
     api("/overview").then(function(d){
       updateDot(d);
       if(state.view==="overview")renderOverview(d);
       else if(state.view==="proxies")renderProxies(d);
       else if(state.view==="events")renderEvents(d);
-    }).catch(noop);
+    }).catch(noop).finally(function(){_polling=false;});
   },5000);
 })();
 </script>

@@ -88,13 +88,23 @@ function controlStub(env) {
   } catch (e) { return null; }
 }
 
+// Durable Object 子请求统一超时: 单线程 DO 繁忙(GC / 路由·事件日志写突发)时请求会排队,
+// 无超时会连累后台 /admin/api/overview 等读路径无限卡住。超时后 control* 返回降级值
+// (undefined/false/null), 调用方回退 caches.default —— 后台最多卡 CONTROL_TIMEOUT_MS 即恢复。
+const CONTROL_TIMEOUT_MS = 3000;
+function controlFetch(stub, url, init) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CONTROL_TIMEOUT_MS);
+  return controlFetch(stub, url, { ...(init || {}), signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
 // Compatibility contract: absent/broken DO binding never throws. Callers
 // fall back to the legacy cache path until the binding is available.
 async function controlGet(env, key) {
   const stub = controlStub(env);
   if (!stub) return undefined;
   try {
-    const r = await stub.fetch('https://control/get?key=' + encodeURIComponent(key));
+    const r = await controlFetch(stub, 'https://control/get?key=' + encodeURIComponent(key));
     if (!r.ok) return undefined;
     const j = await r.json();
     return j.found ? j.value : null;
@@ -105,7 +115,7 @@ async function controlPut(env, key, value, ttl) {
   const stub = controlStub(env);
   if (!stub) return false;
   try {
-    const r = await stub.fetch('https://control/put?key=' + encodeURIComponent(key), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value, ttl }) });
+    const r = await controlFetch(stub, 'https://control/put?key=' + encodeURIComponent(key), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value, ttl }) });
     return r.ok;
   } catch (e) { return false; }
 }
@@ -114,7 +124,7 @@ async function controlDelete(env, key) {
   const stub = controlStub(env);
   if (!stub) return false;
   try {
-    const r = await stub.fetch('https://control/delete?key=' + encodeURIComponent(key), { method: 'DELETE' });
+    const r = await controlFetch(stub, 'https://control/delete?key=' + encodeURIComponent(key), { method: 'DELETE' });
     return r.ok;
   } catch (e) { return false; }
 }
@@ -123,7 +133,7 @@ async function controlAppend(env, key, item, max, ttl) {
   const stub = controlStub(env);
   if (!stub) return false;
   try {
-    const r = await stub.fetch('https://control/append?key=' + encodeURIComponent(key), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item, max, ttl }) });
+    const r = await controlFetch(stub, 'https://control/append?key=' + encodeURIComponent(key), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item, max, ttl }) });
     return r.ok;
   } catch (e) { return false; }
 }
@@ -132,7 +142,7 @@ async function controlList(env, key, max) {
   const stub = controlStub(env);
   if (!stub) return null;
   try {
-    const r = await stub.fetch('https://control/list?key=' + encodeURIComponent(key) + '&max=' + encodeURIComponent(max || 200));
+    const r = await controlFetch(stub, 'https://control/list?key=' + encodeURIComponent(key) + '&max=' + encodeURIComponent(max || 200));
     if (!r.ok) return null;
     const j = await r.json();
     return Array.isArray(j.value) ? j.value : [];
@@ -1271,16 +1281,21 @@ async function flushRoutes(cfg) {
 
 async function readRoutes(cfg) {
   try {
-    await routeFlushChain;   // 等本 isolate 未完成的落盘先写完
-    await flushRoutes(cfg);  // 把 L1 剩余累积写入
+    // 读路径绝不能阻塞在日志写链上 (后台会被卡死): 不 await routeFlushChain、不触发 flush。
+    // 直接读 DO(带超时) + 合并不在本 isolate 尚未落盘的 L1 累积, 快照即可。
+    let base = [];
+    let fromDO = false;
     if (cfg.env) {
       const controlled = await controlList(cfg.env, 'routes', MAX_ROUTES);
-      if (controlled !== null) return controlled;
+      if (controlled !== null) { base = controlled; fromDO = true; }
     }
-    const r = await caches.default.get(ROUTES_KEY);
-    if (!r) return [];
-    const j = await r.json();
-    return Array.isArray(j) ? j.slice(-MAX_ROUTES) : [];
+    if (!fromDO) {
+      const r = await caches.default.get(ROUTES_KEY);
+      if (r) { const j = await r.json(); if (Array.isArray(j)) base = j; }
+    }
+    const merged = [...base, ...ROUTE_L1];
+    if (merged.length > MAX_ROUTES) merged.splice(0, merged.length - MAX_ROUTES);
+    return merged;
   } catch (e) { return []; }
 }
 
@@ -1323,16 +1338,20 @@ async function flushEvents(cfg) {
 
 async function readEvents(cfg) {
   try {
-    await eventFlushChain;   // 等本 isolate 未完成的落盘先写完
-    await flushEvents(cfg);  // 把 L1 剩余累积写进去
+    // 同 readRoutes: 读路径不阻塞日志写链, 快照 DO + 本 isolate L1 累积。
+    let base = [];
+    let fromDO = false;
     if (cfg.env) {
       const controlled = await controlList(cfg.env, 'events', MAX_EVENTS);
-      if (controlled !== null) return controlled;
+      if (controlled !== null) { base = controlled; fromDO = true; }
     }
-    const r = await caches.default.get(EVENTS_KEY);
-    if (!r) return [];
-    const j = await r.json();
-    return Array.isArray(j) ? j.slice(-MAX_EVENTS) : [];
+    if (!fromDO) {
+      const r = await caches.default.get(EVENTS_KEY);
+      if (r) { const j = await r.json(); if (Array.isArray(j)) base = j; }
+    }
+    const merged = [...base, ...EVENT_L1];
+    if (merged.length > MAX_EVENTS) merged.splice(0, merged.length - MAX_EVENTS);
+    return merged;
   } catch (e) { return []; }
 }
 

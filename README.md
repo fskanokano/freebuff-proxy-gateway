@@ -189,6 +189,7 @@ curl https://<gateway>.workers.dev/healthz   # 公开, 无需 key
 - 非流式 chat 有单次尝试超时（`CHAT_TIMEOUT_MS`）；流式响应不做网关侧超时，挂起的流由客户端断开兜底（客户端取消会中止上游请求并返回 499，且不会把健康 proxy 误标 down）
 - 单 proxy 配了多个 token 也能用（healthz 只取 `tokens[0]`）——但建议按"1 proxy = 1 token"部署以让网关的额度视图精确
 - 路由/事件日志持久化到 `GATEWAY_CONTROL`（无 binding 时回退 `caches.default`），TTL 默认 1h 且 DO 每小时 alarm 清理过期 key，防止日志打满 DO；`/v1/models` 每次聚合各 proxy 实况（只读缓存状态，不触发探测）
+- DO 子请求统一 `3s` 超时，后台读路径（overview 的 routes/events 读取）不阻塞日志写链、不触发写 —— 单线程 DO 繁忙（GC/日志写突发）时后台最多卡 3s 即降级回退缓存，不会无限卡住
 
 ## 测试
 
