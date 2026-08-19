@@ -3,8 +3,8 @@
  *
  * 拓扑:  N 个 freebuff-proxy 实例, 每实例只配 1 个 FreeBuff token。
  *        本 Worker 部署在 CF 边缘, 作为统一 OpenAI 兼容入口:
- *          - 按剩余额度选路: 读取各 proxy 的 /healthz (UsagePct + SpendPct 消费额度 + 每模型会话额度),
- *            选 score 最低(余量最多)的 proxy
+ *          - 按剩余额度选路: 读取各 proxy 的 /healthz (UsagePct + SpendPct 消费额度 + 每模型会话额度
+ *            + 风险等级 RiskLevel), 选 score 最低(余量最多)的 proxy
  *          - 钉住 (sticky pin): 同一客户端(或 X-Sticky-Id)持续路由到当前 proxy,
  *            直到它额度耗尽
  *          - 带内失败切换: 429/402(额度类)/403/5xx/网络错 → 标记状态, 重放请求
@@ -316,6 +316,11 @@ function blankState(p) {
     spendLimit: 0,           // MAX_SPEND_PER_DAY 建议上限 (ledger 单位)
     spendDay: 0,             // 当前太平洋日消费桶 (healthz SpendDay)
     spendLimited: 0,         // 上游 spend_limited 拒绝累计 (healthz SpendLimited)
+    spend24h: 0,             // 滚动 24h 消费 (healthz Spend24h, 观测)
+    spendWeek: 0,            // 太平洋周消费桶 (healthz SpendWeek, 观测)
+    spendMonth: 0,           // 太平洋月消费桶 (healthz SpendMonth, 观测)
+    tier: '',                // 上游访问档位 (healthz tier, 观测)
+    country: '',             // 出口国家 (healthz country, 观测)
     mode: '',                // proxy 路由模式 (pooled | bridge | hybrid)
     bridgeTokens: 0,         // bridge 模式缓存条目数 (healthz bridge_tokens)
     quota: {},               // model -> {limit, recentCount, resetAt, period}
@@ -406,6 +411,7 @@ function parseHealthz(json) {
       dailyLimit: 0, messages24h: 0,
       risk: '', sessionStatus: '',
       spendPct: 0, spendLimit: 0, spendDay: 0, spendLimited: 0,
+      spend24h: 0, spendWeek: 0, spendMonth: 0, tier: '', country: '',
       mode, bridgeTokens,
     };
   }
@@ -439,8 +445,10 @@ function parseHealthz(json) {
   // 用已持久化的 st.quota[model] 折合 (见 modelScore/buildCandidates): 探测是单飞(name+url 去重),
   // 无法按请求模型各自探测, 故不能在这里传入 model。
   let score = Math.max(usagePct, spendPct);
-  // critical 风险账号降权但不剔除
+  // 风险账号降权但不剔除 (#6): RiskLevel 现为 low/moderate/high/critical 四级。
+  // critical(封禁/近满) → ≥90; high(冷却/高用量/高频) → ≥70; moderate(~30% 用量) 已由 usagePct 反映, 无需再抬。
   if (t.RiskLevel === 'critical') score = Math.max(score, 90);
+  else if (t.RiskLevel === 'high') score = Math.max(score, 70);
   return {
     usagePct, quota, resetAt, cooldownUntil, score,
     dailyLimit, messages24h,
@@ -448,6 +456,11 @@ function parseHealthz(json) {
     sessionStatus: t.SessionStatus || '',
     spendPct, spendLimit, spendDay,
     spendLimited: Number(t.SpendLimited) || 0,
+    spend24h: Number(t.Spend24h) || 0,
+    spendWeek: Number(t.SpendWeek) || 0,
+    spendMonth: Number(t.SpendMonth) || 0,
+    tier: t.tier || '',
+    country: t.country || '',
     mode, bridgeTokens,
   };
 }
@@ -467,6 +480,11 @@ function applyHealthz(st, h) {
   st.spendLimit = h.spendLimit || 0;
   st.spendDay = h.spendDay || 0;
   st.spendLimited = h.spendLimited || 0;
+  st.spend24h = h.spend24h || 0;
+  st.spendWeek = h.spendWeek || 0;
+  st.spendMonth = h.spendMonth || 0;
+  st.tier = h.tier || '';
+  st.country = h.country || '';
   st.mode = h.mode || '';
   st.bridgeTokens = h.bridgeTokens || 0;
 
@@ -1547,6 +1565,11 @@ async function handleGatewayHealth(cfg) {
     spend_limit: st.spendLimit || null,
     spend_day: st.spendDay || null,
     spend_limited: st.spendLimited || null,
+    spend_24h: st.spend24h || null,
+    spend_week: st.spendWeek || null,
+    spend_month: st.spendMonth || null,
+    tier: st.tier || null,
+    country: st.country || null,
     mode: st.mode || null,
     bridge_tokens: st.bridgeTokens || null,
     quota: Object.fromEntries(Object.entries(st.quota || {}).map(([m, q]) => [
@@ -1598,6 +1621,11 @@ async function adminOverview(cfg) {
     spend_limit: st.spendLimit || null,
     spend_day: st.spendDay || null,
     spend_limited: st.spendLimited || null,
+    spend_24h: st.spend24h || null,
+    spend_week: st.spendWeek || null,
+    spend_month: st.spendMonth || null,
+    tier: st.tier || null,
+    country: st.country || null,
     mode: st.mode || null,
     bridge_tokens: st.bridgeTokens || null,
     risk: st.risk || null,

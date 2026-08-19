@@ -32,7 +32,7 @@ globalThis.caches = { default: new MockCache() };
 
 // ── mock proxy ──────────────────────────────────────────────
 
-let portCounter = 10000;
+let portCounter = 30000; // 高起点: 避开开发沙箱/系统保留的低端口 (10034-10036 曾被 DSH 网络助手占用导致 EADDRINUSE)
 const allProxies = [];
 
 // ctl 可变状态:
@@ -46,6 +46,7 @@ export function makeProxy(name) {
   const ctl = {
     name, usagePct: 0, cooldownUntilMs: 0, quota: {}, fail: null, mode: 'sse',
     spendPct: 0, spendLimit: 0, spendDay: 0, spendLimited: 0, bridgeMode: false, accessTier: 'full',
+    riskLevel: 'low', spend24h: 0, spendWeek: 0, spendMonth: 0, tier: 'full', country: 'US',
     healthzStatus: 200, healthzBody: null, healthzDelay: 0,
     chatDelay: 0, modelsDelay: 0,
     chatHits: 0, healthzHits: 0, modelsHits: 0, lastModel: null, lastBody: '',
@@ -70,11 +71,16 @@ export function makeProxy(name) {
             Messages24h: Math.round((ctl.usagePct / 100) * 20),
             DailyLimit: 20,
             UsagePct: ctl.usagePct,
-            RiskLevel: 'low',
+            RiskLevel: ctl.riskLevel,
+            Spend24h: ctl.spend24h,
             SpendDay: ctl.spendDay,
+            SpendWeek: ctl.spendWeek,
+            SpendMonth: ctl.spendMonth,
             SpendLimit: ctl.spendLimit,
             SpendPct: ctl.spendPct,
             SpendLimited: ctl.spendLimited,
+            tier: ctl.tier,
+            country: ctl.country,
             quota: Object.fromEntries(Object.entries(ctl.quota).map(([m, q]) => [
               m, { limit: q.limit, recent_count: q.recentCount, reset_at: q.resetAtMs ? new Date(q.resetAtMs).toISOString() : null, period: 'pacific_day' },
             ])),
@@ -962,6 +968,26 @@ await t('PR6 ok 首次探测失败保持 ok, 连续 2 次才降级 (防 ok↔unk
   // 3) 连续第 2 次失败 → 降级 unknown
   r = await worker.fetch(gwReq('/admin/api/probe', { method: 'POST', body: { name: n1 }, key: 't-p6' }), env, {});
   assert.equal((await r.json()).results[0].status, 'unknown', '连续 2 次探测失败才应降级为 unknown');
+});
+
+await t('RX1 RiskLevel high → score≥70 降权; 新观测字段(spend 窗口/tier/country)落盘', async () => {
+  const p1 = await makeProxy('rxa');
+  const [n1] = proxyNames([p1]);
+  p1.ctl.riskLevel = 'high';
+  p1.ctl.usagePct = 0;   // score 只应来自风险降权, 与用量无关
+  p1.ctl.spendPct = 0;
+  p1.ctl.spend24h = 123; p1.ctl.spendWeek = 456; p1.ctl.spendMonth = 789;
+  p1.ctl.tier = 'limited'; p1.ctl.country = 'CN';
+  const env = envFor([p1], { API_KEY: 't-rx1' });
+  const r = await worker.fetch(gwReq('/admin/api/probe', { method: 'POST', body: { name: n1 }, key: 't-rx1' }), env, {});
+  assert.equal(r.status, 200);
+  const hz = await hzOf(env, n1);
+  assert.ok(hz.score >= 70, 'high risk should floor score at 70, got ' + hz.score);
+  assert.equal(hz.spend_24h, 123);
+  assert.equal(hz.spend_week, 456);
+  assert.equal(hz.spend_month, 789);
+  assert.equal(hz.tier, 'limited');
+  assert.equal(hz.country, 'CN');
 });
 
 await t('PR5 /healthz 只读: 不触发探测; 探测经路由触发后状态落盘', async () => {

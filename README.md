@@ -48,7 +48,7 @@ LISTEN_ADDR=:3457          # 或平台要求的 :$PORT, 见各平台适配
 
 验证：`curl https://<proxy-url>/healthz` 应返回 `{"status":"ok","tokens":[{...,"UsagePct":0,...}]}`。
 
-> 额度信号说明：`/healthz` 的 `UsagePct` 是 proxy 侧 `MAX_MESSAGES_PER_DAY` 的滚动 24h 用量（未配置则为 0）；`SpendPct` 是 `MAX_SPEND_PER_DAY` 的太平洋日消费额度百分比（上游 `$` 上限才是真正门槛，建议配它以让 score 更贴近真实余量）；`quota.<model>.{limit,recent_count,reset_at}` 是 FreeBuff 会话额度（proxy 通过其内部零成本 GET 探测维护，≤60s 刷新一次）。三个信号网关都消费（score 取三者最大）。
+> 额度信号说明：`/healthz` 的 `UsagePct` 是 proxy 侧 `MAX_MESSAGES_PER_DAY` 的滚动 24h 用量（未配置则为 0）；`SpendPct` 是 `MAX_SPEND_PER_DAY` 的太平洋日消费额度百分比（上游 `$` 上限才是真正门槛，建议配它以让 score 更贴近真实余量）；`quota.<model>.{limit,recent_count,reset_at}` 是 FreeBuff 会话额度（proxy 通过其内部零成本 GET 探测维护，≤60s 刷新一次）。三个信号网关都消费（score 取三者最大）。此外 `RiskLevel`（low/moderate/high/critical）会设 score 下限：`critical` ≥90、`high` ≥70（封禁/冷却/高频账号降权）；`Spend24h/SpendWeek/SpendMonth`（更长窗口消费）、`tier`（访问档位）、`country`（出口国家）为观测字段，仅透传到 /healthz 与后台展示，不参与选路。
 
 ## 部署网关
 
