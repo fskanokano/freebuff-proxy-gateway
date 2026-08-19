@@ -92,6 +92,10 @@ function controlStub(env) {
 // 无超时会连累后台 /admin/api/overview 等读路径无限卡住。超时后 control* 返回降级值
 // (undefined/false/null), 调用方回退 caches.default —— 后台最多卡 CONTROL_TIMEOUT_MS 即恢复。
 const CONTROL_TIMEOUT_MS = 10000;
+// 出口 IP 探测: 聚合各 proxy 的 GET /egress/ip (vercel-suibuff-go 的 Vercel 专属端点,
+// 公网出口 IP + 地理位置, 无鉴权)。出口 IP 变化极慢, 成功结果缓存 5 分钟避免频繁打免费供应商。
+const EGRESS_TIMEOUT_MS = 15000;
+const EGRESS_CACHE_TTL_S = 300;
 function controlFetch(stub, url, init) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), CONTROL_TIMEOUT_MS);
@@ -1781,6 +1785,58 @@ async function adminProbe(req, cfg) {
   });
 }
 
+// 出口 IP 探测: 并行拉取每个 proxy 的 /egress/ip, 返回 {name,url,ok,ip,country,...}。
+// 成功结果缓存 EGRESS_CACHE_TTL_S (出口 IP 稳定, 避免高频打免费 IP 供应商), 失败短缓存 60s。
+async function adminEgress(cfg) {
+  const results = await Promise.all(cfg.proxies.map(async (p) => {
+    const ck = CACHE_ORIGIN + '/egress:' + p.name + '|' + hashKey(p.url);
+    try {
+      const cr = await caches.default.get(ck);
+      if (cr) {
+        const cj = await cr.json();
+        if (cj && cj.t && (nowMs() - cj.t) < (cj.ok ? EGRESS_CACHE_TTL_S : 60) * 1000) {
+          const { t: _t, ...cached } = cj;
+          return { ...cached, cached: true };
+        }
+      }
+    } catch (e) {}
+    const out = { name: p.name, url: p.url, ok: false, cached: false };
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), EGRESS_TIMEOUT_MS);
+      const res = await fetch(p.url + '/egress/ip', {
+        headers: { 'User-Agent': 'cf-quota-gateway/1', Accept: 'application/json' },
+        signal: ctrl.signal,
+      });
+      clearTimeout(to);
+      if (res.status !== 200) throw new Error('egress HTTP ' + res.status);
+      const j = await res.json();
+      if (j && j.ok) {
+        out.ok = true;
+        out.ip = j.ip || null;
+        out.country = j.country || null;
+        out.country_name = j.country_name || null;
+        out.region = j.region || null;
+        out.city = j.city || null;
+        out.provider = j.provider || null;
+      } else {
+        out.error = (j && j.error) || 'egress probe failed';
+      }
+    } catch (e) {
+      out.error = String(e.message || e);
+    }
+    try {
+      await caches.default.put(ck, new Response(JSON.stringify({ ...out, t: nowMs() }), {
+        headers: { 'Content-Type': 'application/json' },
+      }), { ttl: out.ok ? EGRESS_CACHE_TTL_S : 60 });
+    } catch (e) {}
+    return out;
+  }));
+  return new Response(JSON.stringify({ results, total: results.length }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+  });
+}
+
 // 清空持久化日志 (路由记录 + 系统事件), 防止日志把 Durable Object / cache 打满
 async function adminClearLogs(cfg) {
   try {
@@ -2051,6 +2107,7 @@ export default {
         case 'POST /maintenance': return adminMaintenance(request, cfg);
         case 'POST /pin': return adminPin(request, cfg);
         case 'GET /pin': return adminPinStatus(request, cfg);
+        case 'GET /egress': return adminEgress(cfg);
         case 'POST /smoke': return adminSmoke(request, cfg);
         default: return errorResponse(404, 'not_found', 'unknown admin api: ' + apiPath, {});
       }

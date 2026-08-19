@@ -48,6 +48,7 @@ export function makeProxy(name) {
     spendPct: 0, spendLimit: 0, spendDay: 0, spendLimited: 0, bridgeMode: false, accessTier: 'full',
     riskLevel: 'low', spend24h: 0, spendWeek: 0, spendMonth: 0, tier: 'full', country: 'US',
     healthzStatus: 200, healthzBody: null, healthzDelay: 0,
+    egressIp: '203.0.113.7', egressCountry: 'US', egressStatus: 200, egressBody: null, egressHits: 0,
     chatDelay: 0, modelsDelay: 0,
     chatHits: 0, healthzHits: 0, modelsHits: 0, lastModel: null, lastBody: '',
     lastAuth: '', healthzLastAuth: '', clientAborted: false, streamStarted: false,
@@ -88,6 +89,18 @@ export function makeProxy(name) {
         }
       };
       if (ctl.healthzDelay > 0) setTimeout(send, ctl.healthzDelay); else send();
+      return;
+    }
+    if (url.pathname === '/egress/ip') {
+      ctl.egressHits++;
+      if (ctl.egressStatus && ctl.egressStatus !== 200) {
+        res.writeHead(ctl.egressStatus, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'egress probe failed' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (ctl.egressBody != null) res.end(ctl.egressBody);
+      else res.end(JSON.stringify({ ok: true, ip: ctl.egressIp, country: ctl.egressCountry, country_name: 'United States', region: 'California', city: 'Los Angeles', provider: 'mock' }));
       return;
     }
     if (url.pathname === '/v1/models') {
@@ -988,6 +1001,36 @@ await t('RX1 RiskLevel high → score≥70 降权; 新观测字段(spend 窗口/
   assert.equal(hz.spend_month, 789);
   assert.equal(hz.tier, 'limited');
   assert.equal(hz.country, 'CN');
+});
+
+await t('EG1 /admin/api/egress 聚合各代理出口 IP (成功 + 单点失败降级)', async () => {
+  const p1 = await makeProxy('eg1a'); const p2 = await makeProxy('eg1b');
+  const [n1, n2] = proxyNames([p1, p2]);
+  p1.ctl.egressIp = '198.51.100.11'; p1.ctl.egressCountry = 'JP';
+  p2.ctl.egressIp = '198.51.100.22'; p2.ctl.egressCountry = 'DE';
+  const env = envFor([p1, p2], { API_KEY: 't-eg1' });
+  const res = await worker.fetch(gwReq('/admin/api/egress', { method: 'GET', key: 't-eg1' }), env, {});
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.total, 2);
+  const byName = Object.fromEntries(j.results.map(r => [r.name, r]));
+  assert.equal(byName[n1].ok, true);
+  assert.equal(byName[n1].ip, '198.51.100.11');
+  assert.equal(byName[n1].country, 'JP');
+  assert.equal(byName[n1].provider, 'mock');
+  assert.equal(byName[n2].ip, '198.51.100.22');
+  assert.equal(byName[n2].country, 'DE');
+  // 单点失败不影响其余: 独立代理 (避免命中上面的成功缓存) 注入 502
+  const p3 = await makeProxy('eg1c');
+  const [n3] = proxyNames([p3]);
+  p3.ctl.egressStatus = 502;
+  const env2 = envFor([p3], { API_KEY: 't-eg1' });
+  const res2 = await worker.fetch(gwReq('/admin/api/egress', { method: 'GET', key: 't-eg1' }), env2, {});
+  const j2 = await res2.json();
+  assert.equal(j2.total, 1);
+  assert.equal(j2.results[0].name, n3);
+  assert.equal(j2.results[0].ok, false);
+  assert.ok(j2.results[0].error, '失败应带 error');
 });
 
 await t('PR5 /healthz 只读: 不触发探测; 探测经路由触发后状态落盘', async () => {
