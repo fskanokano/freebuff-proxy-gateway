@@ -1787,8 +1787,17 @@ async function adminProbe(req, cfg) {
 
 // 出口 IP 探测: 并行拉取每个 proxy 的 /egress/ip, 返回 {name,url,ok,ip,country,...}。
 // 成功结果缓存 EGRESS_CACHE_TTL_S (出口 IP 稳定, 避免高频打免费 IP 供应商), 失败短缓存 60s。
-async function adminEgress(cfg) {
-  const results = await Promise.all(cfg.proxies.map(async (p) => {
+async function adminEgress(req, cfg) {
+  // 可选 ?name=X: 只探测单个代理 (卡片按钮用)
+  let targets = cfg.proxies;
+  try {
+    const onlyName = new URL(req.url).searchParams.get('name');
+    if (onlyName) {
+      targets = cfg.proxies.filter(p => p.name === onlyName);
+      if (!targets.length) return errorResponse(404, 'not_found', 'no such proxy: ' + onlyName, {});
+    }
+  } catch (e) {}
+  const results = await Promise.all(targets.map(async (p) => {
     const ck = CACHE_ORIGIN + '/egress:' + p.name + '|' + hashKey(p.url);
     try {
       const cr = await caches.default.get(ck);
@@ -2107,7 +2116,7 @@ export default {
         case 'POST /maintenance': return adminMaintenance(request, cfg);
         case 'POST /pin': return adminPin(request, cfg);
         case 'GET /pin': return adminPinStatus(request, cfg);
-        case 'GET /egress': return adminEgress(cfg);
+        case 'GET /egress': return adminEgress(request, cfg);
         case 'POST /smoke': return adminSmoke(request, cfg);
         default: return errorResponse(404, 'not_found', 'unknown admin api: ' + apiPath, {});
       }

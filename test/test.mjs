@@ -1033,6 +1033,22 @@ await t('EG1 /admin/api/egress 聚合各代理出口 IP (成功 + 单点失败�
   assert.ok(j2.results[0].error, '失败应带 error');
 });
 
+await t('EG2 /admin/api/egress?name= 单代理过滤', async () => {
+  const p1 = await makeProxy('eg2a'); const p2 = await makeProxy('eg2b');
+  const [n1] = proxyNames([p1, p2]);
+  p1.ctl.egressIp = '203.0.113.1';
+  const env = envFor([p1, p2], { API_KEY: 't-eg2' });
+  const res = await worker.fetch(gwReq('/admin/api/egress?name=' + n1, { method: 'GET', key: 't-eg2' }), env, {});
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.total, 1);
+  assert.equal(j.results[0].name, n1);
+  assert.equal(j.results[0].ip, '203.0.113.1');
+  // 未知 name → 404
+  const res404 = await worker.fetch(gwReq('/admin/api/egress?name=nope', { method: 'GET', key: 't-eg2' }), env, {});
+  assert.equal(res404.status, 404);
+});
+
 await t('PR5 /healthz 只读: 不触发探测; 探测经路由触发后状态落盘', async () => {
   const p1 = await makeProxy('p5a'); const p2 = await makeProxy('p5b');
   const [n1] = proxyNames([p1, p2]);
