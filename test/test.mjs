@@ -1608,7 +1608,7 @@ await t('RUN1 保存代理列表 → 立即生效, 路由用新代理 + 各自�
   pb.ctl.usagePct = 0; pa.ctl.usagePct = 50;
   // 后台保存运行时配置: [ra, rb] (替换环境变量列表)
   const save = await worker.fetch(new Request('https://gw.example/admin/api/config', { method: 'POST', headers: { Authorization: 'Bearer t-run1', 'Content-Type': 'application/json' }, body: JSON.stringify({ proxies: [
-    { name: 'ra', url: pa.url, apiKey: 'kA' },
+    { name: 'ra', url: pa.url, apiKey: 'kA', remark: '  主线路  ' },
     { name: 'rb', url: pb.url, apiKey: 'kB' },
   ] }) }), env, {});
   assert.equal(save.status, 200);
@@ -1617,6 +1617,12 @@ await t('RUN1 保存代理列表 → 立即生效, 路由用新代理 + 各自�
   assert.equal(cfg.config.runtime_managed, true);
   assert.equal(cfg.config.has_runtime_config, true);
   assert.equal(cfg.config.proxies.length, 2);
+  // 备注: 可选字段, trim 后保存; 未提供的代理为 null
+  assert.equal(cfg.config.proxies[0].remark, '主线路');
+  assert.equal(cfg.config.proxies[1].remark, null);
+  // overview 也带 remark
+  const ov = await (await worker.fetch(new Request('https://gw.example/admin/api/overview', { headers: { Authorization: 'Bearer t-run1' } }), env, {})).json();
+  assert.equal(ov.proxies[0].remark, '主线路');
   // 路由用新列表: 冷启动 LRU → ra (首个), 用运行时保存的 apiKey kA
   let res = await worker.fetch(gwReq('/v1/chat/completions', { body: { model: 'freebuff-1', messages: [] }, key: 't-run1' }), env, {});
   assert.equal(res.status, 200);

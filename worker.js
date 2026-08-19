@@ -1495,7 +1495,7 @@ async function applyRuntimeConfig(cfg) {
         // 与 env 解析一致: 同一 URL 两个 name 会导致双倍探测、双倍消耗探测额度
         if (seenUrls.has(url)) throw new Error('proxy #' + (i + 1) + ': duplicate url ' + url);
         seenUrls.add(url);
-        return { name, url, apiKey: String(p.apiKey) };
+        return { name, url, apiKey: String(p.apiKey), remark: p.remark || null };
       });
       cfg.runtimeProxies = true;
     } catch (e) {
@@ -1585,6 +1585,7 @@ async function adminOverview(cfg) {
     return {
     name: st.name,
     url: st.url,
+    remark: (cfg.proxies[i] && cfg.proxies[i].remark) || null,
     status: isMaint ? 'maint' : st.status,
     maint: isMaint,
     reason: st.reason || '',
@@ -1634,7 +1635,7 @@ async function adminConfig(cfg) {
   return new Response(JSON.stringify({
     config: {
       // 生效配置 (含运行时覆盖后的结果); proxies 带完整 apiKey (管理后台可见, 供编辑回填)
-      proxies: cfg.proxies.map(p => ({ name: p.name, url: p.url, apiKey: p.apiKey })),
+      proxies: cfg.proxies.map(p => ({ name: p.name, url: p.url, apiKey: p.apiKey, remark: p.remark || null })),
       pin_mode: cfg.pinMode,
       probe_mode: cfg.probeMode,
       pin_ttl: cfg.pinTtl,
@@ -1684,6 +1685,10 @@ async function adminSaveConfig(req, cfg) {
       name: String(p.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || 'p' + (i + 1),
       url: String(p.url).replace(/\/+$/, ''),
       apiKey: String(p.apiKey),
+      // 可选备注: 字符串, trim 后截断 200 字符; 空/非字符串时省略
+      ...(p.remark !== undefined && p.remark !== null && String(p.remark).trim()
+        ? { remark: String(p.remark).trim().slice(0, 200) }
+        : {}),
     }));
   }
   if (body.settings !== undefined) {
